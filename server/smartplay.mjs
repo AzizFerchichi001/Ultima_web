@@ -796,7 +796,7 @@ export async function listCourtsWithCalibrations(arenaId) {
   if (arenaId) {
     const result = await pool.query(
       `SELECT c.id, c.name, c.sport, c.court_type, c.surface_type, c.is_active,
-              a.name AS arena_name,
+              a.name AS arena_name, a.location AS arena_location,
               cc.id AS calib_id, cc.status AS calib_status, cc.is_active AS calib_is_active,
               cc.computed_at, cc.updated_at AS calib_updated_at
        FROM courts c

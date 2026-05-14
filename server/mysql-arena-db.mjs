@@ -313,6 +313,38 @@ export async function getUserById(userId) {
   return findUserById(Number(userId));
 }
 
+export async function updateUserProfile(userId, { firstName, lastName }) {
+  const fields = [];
+  const params = [];
+
+  if (firstName !== undefined) {
+    const value = String(firstName ?? "").trim();
+    if (!value) {
+      throw new Error("First name cannot be empty");
+    }
+    fields.push("first_name = ?");
+    params.push(value);
+  }
+
+  if (lastName !== undefined) {
+    const value = String(lastName ?? "").trim();
+    if (!value) {
+      throw new Error("Last name cannot be empty");
+    }
+    fields.push("last_name = ?");
+    params.push(value);
+  }
+
+  const normalizedUserId = Number(userId);
+  if (!fields.length) {
+    return findUserById(normalizedUserId);
+  }
+
+  params.push(normalizedUserId);
+  await pool.query(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, params);
+  return findUserById(normalizedUserId);
+}
+
 async function addActivityLog(connection, { arenaId = null, actorUserId = null, actorName, action, detail }) {
   await connection.query(
     `INSERT INTO activity_logs (arena_id, action, actor_user_id, actor_name, detail, created_at)
@@ -1522,7 +1554,7 @@ export async function createReservation({
   }
 }
 
-export async function cancelReservation(id, actor) {
+export async function cancelReservation(id, actor, reason = null) {
   const connection = await pool.getConnection();
 
   try {
@@ -1592,7 +1624,7 @@ export async function cancelReservation(id, actor) {
     });
 
     await connection.commit();
-    return { changes: result.affectedRows };
+    return { changes: result.affectedRows, success: true, reservation, cancelledSession: null };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -1600,6 +1632,9 @@ export async function cancelReservation(id, actor) {
     connection.release();
   }
 }
+
+// Stub — MySQL schema does not include refund columns; noop keeps the interface consistent.
+export async function updateReservationRefund(_id, _fields) {}
 
 export async function listCompetitions(actor = null) {
   const params = [];

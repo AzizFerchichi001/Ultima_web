@@ -150,6 +150,14 @@ const PaymentSuccess = () => {
                     <p className="text-[11px] text-muted-foreground">
                       Point your phone camera at the code — the PDF will download directly.
                     </p>
+                    <a
+                      href={mobileQr}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-sm font-semibold text-primary underline underline-offset-4"
+                    >
+                      Open PDF
+                    </a>
                   </div>
                 ) : (
                   <div className="flex items-center justify-center h-[200px]">

@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -556,6 +556,8 @@ const resolveRole = (user) => (user?.platform_role === "super_admin" ? "super_ad
 const resolveStatus = (user) => (user?.platform_role === "super_admin" ? user?.status ?? "inactive" : user?.membership_status ?? user?.status ?? "inactive");
 const isAdminLike = (actor) => actor?.effective_role === "admin" || actor?.effective_role === "super_admin";
 const isCoachLike = (actor) => ["coach", "admin", "super_admin"].includes(actor?.effective_role);
+const normalizeEmail = (email) => String(email ?? "").trim().toLowerCase();
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 const sanitizeCourt = (court) => ({ ...court, created_at: toIso(court.created_at) });
 const sanitizeLog = (log) => ({ ...log, created_at: toIso(log.created_at) });
@@ -563,6 +565,7 @@ const sanitizeCompetition = (competition) => ({ ...competition, created_at: toIs
 const sanitizeReservation = (reservation) => ({
   ...reservation,
   created_at: toIso(reservation.created_at),
+  cancelled_at: toIso(reservation.cancelled_at),
   reservation_date: String(reservation.reservation_date).slice(0, 10),
   start_time: String(reservation.start_time).slice(0, 8),
   end_time: String(reservation.end_time).slice(0, 8),
@@ -644,6 +647,26 @@ async function findUserById(id, client = pool) {
 
 export async function getUserById(id) {
   return findUserById(Number(id));
+}
+
+export async function updateUserProfile(userId, { firstName, lastName }) {
+  const fields = [];
+  const params = [];
+  const set = (col, val) => { fields.push(`${col} = $${params.length + 1}`); params.push(val); };
+  if (firstName !== undefined) {
+    const fn = String(firstName ?? "").trim();
+    if (!fn) throw new Error("First name cannot be empty");
+    set("first_name", fn);
+  }
+  if (lastName !== undefined) {
+    const ln = String(lastName ?? "").trim();
+    if (!ln) throw new Error("Last name cannot be empty");
+    set("last_name", ln);
+  }
+  if (!fields.length) return findUserById(Number(userId));
+  params.push(Number(userId));
+  await pool.query(`UPDATE users SET ${fields.join(", ")} WHERE id = $${params.length}`, params);
+  return findUserById(Number(userId));
 }
 
 async function requireActiveActor(userId, client = pool) {
@@ -789,6 +812,9 @@ export async function initializeDatabase() {
 
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cin_number VARCHAR(32)");
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL");
+  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false");
+  await pool.query("ALTER TABLE arena_memberships ADD COLUMN IF NOT EXISTS head_coach_flag BOOLEAN NOT NULL DEFAULT false");
+  await pool.query("ALTER TABLE arena_memberships ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ NULL");
   await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_cin_number ON users (cin_number) WHERE cin_number IS NOT NULL");
   await pool.query(
     `CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -882,6 +908,13 @@ export async function initializeDatabase() {
   await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS price_per_hour NUMERIC(10,2)");
   await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'TND'");
   await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS image_url TEXT");
+
+  // Competition extended fields
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS rules TEXT NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS prizes TEXT NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS end_date DATE NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS registration_deadline DATE NULL");
+  await pool.query("ALTER TABLE competition_registrations ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()").catch(() => {});
 
   // SmartPlay AI tables
   await pool.query(`
@@ -1096,10 +1129,40 @@ export async function initializeDatabase() {
 
   // Stripe payment support
   await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_amount NUMERIC(10,2) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_currency VARCHAR(10) DEFAULT 'TND'");
   await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255) NULL");
   await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS payment_amount NUMERIC(10,2) NULL");
   await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50) NOT NULL DEFAULT 'pending'");
   await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS coaching_reservation_id INT NULL REFERENCES reservations(id)");
+
+  // Cancellation metadata and refund tracking
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_user_id INT NULL REFERENCES users(id)");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_actor_role VARCHAR(50) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_status VARCHAR(30) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS stripe_refund_id VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refunded_amount NUMERIC(10,2) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_error TEXT NULL");
+  await pool.query("ALTER TABLE reservation_participants ALTER COLUMN user_id DROP NOT NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS email VARCHAR(191) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS display_name VARCHAR(191) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS role VARCHAR(32) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS slot INT NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'confirmed'");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS invitation_token VARCHAR(128) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+  await pool.query(
+    `UPDATE reservation_participants rp
+     SET email = users.email,
+         display_name = CONCAT(users.first_name, ' ', users.last_name),
+         updated_at = NOW()
+     FROM users
+     WHERE rp.user_id = users.id
+       AND (rp.email IS NULL OR rp.email = '')`
+  );
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_reservation_participants_email ON reservation_participants (LOWER(email))");
 
   await seedShowcaseArenas();
 }
@@ -1162,6 +1225,16 @@ export async function createUser({
        SELECT id, $1, $2, 'active', NOW() FROM arenas
        ON CONFLICT DO NOTHING`,
       [userId, membershipRole]
+    );
+    await client.query(
+      `UPDATE reservation_participants
+       SET user_id = $1,
+           display_name = $2,
+           status = CASE WHEN status = 'pending_account' THEN 'confirmed' ELSE status END,
+           updated_at = NOW()
+       WHERE user_id IS NULL
+         AND LOWER(email) = LOWER($3)`,
+      [userId, `${firstName} ${lastName}`.trim(), email]
     );
     await client.query("COMMIT");
     return findUserByEmail(email);
@@ -1247,10 +1320,26 @@ export async function listReservationsForUser(userId) {
        reservations.id, reservations.user_id, reservations.court_id,
        reservations.reservation_date, reservations.start_time, reservations.end_time,
        reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+       reservations.cancelled_at, reservations.cancellation_reason, reservations.refund_status,
+       reservations.refunded_amount, reservations.payment_status, reservations.payment_amount,
+       reservations.payment_currency,
        courts.name AS court_name, courts.sport, courts.arena_id, arenas.name AS arena_name,
        COALESCE(
-         json_agg(json_build_object('id', participants.id, 'firstName', participants.first_name, 'lastName', participants.last_name, 'email', participants.email))
-         FILTER (WHERE participants.id IS NOT NULL),
+         json_agg(
+           json_build_object(
+             'id', rp_all.id,
+             'userId', participants.id,
+             'firstName', participants.first_name,
+             'lastName', participants.last_name,
+             'displayName', COALESCE(rp_all.display_name, NULLIF(TRIM(CONCAT(participants.first_name, ' ', participants.last_name)), '')),
+             'email', COALESCE(rp_all.email, participants.email),
+             'status', COALESCE(rp_all.status, 'confirmed'),
+             'role', COALESCE(rp_all.role, CASE WHEN participants.id = reservations.user_id THEN 'creator' ELSE 'participant' END),
+             'slot', rp_all.slot
+           )
+           ORDER BY COALESCE(rp_all.slot, 999), rp_all.id
+         )
+         FILTER (WHERE rp_all.id IS NOT NULL),
          '[]'::json
        ) AS participants
      FROM reservation_participants rp_self
@@ -1265,6 +1354,57 @@ export async function listReservationsForUser(userId) {
     [userId]
   );
   return rows.map(sanitizeReservation);
+}
+
+export async function getReservationForUser(reservationId, actor) {
+  const { rows } = await pool.query(
+    `SELECT
+       reservations.id, reservations.user_id, reservations.court_id,
+       reservations.reservation_date, reservations.start_time, reservations.end_time,
+       reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+       reservations.cancelled_at, reservations.cancellation_reason,
+       reservations.refund_status, reservations.refunded_amount, reservations.payment_status,
+       reservations.payment_amount, reservations.payment_currency, reservations.stripe_session_id,
+       courts.name AS court_name, courts.sport, courts.arena_id, arenas.name AS arena_name,
+       arenas.location AS arena_location,
+       COALESCE(
+         json_agg(
+           json_build_object(
+             'id', rp_all.id,
+             'userId', participants.id,
+             'firstName', participants.first_name,
+             'lastName', participants.last_name,
+             'displayName', COALESCE(rp_all.display_name, NULLIF(TRIM(CONCAT(participants.first_name, ' ', participants.last_name)), '')),
+             'email', COALESCE(rp_all.email, participants.email),
+             'status', COALESCE(rp_all.status, 'confirmed'),
+             'role', COALESCE(rp_all.role, CASE WHEN participants.id = reservations.user_id THEN 'creator' ELSE 'participant' END),
+             'slot', rp_all.slot
+           )
+           ORDER BY COALESCE(rp_all.slot, 999), rp_all.id
+         )
+         FILTER (WHERE rp_all.id IS NOT NULL),
+         '[]'::json
+       ) AS participants
+     FROM reservations
+     JOIN courts ON courts.id = reservations.court_id
+     JOIN arenas ON arenas.id = courts.arena_id
+     LEFT JOIN reservation_participants rp_all ON rp_all.reservation_id = reservations.id
+     LEFT JOIN users AS participants ON participants.id = rp_all.user_id
+     WHERE reservations.id = $1
+     GROUP BY reservations.id, courts.name, courts.sport, courts.arena_id, arenas.name, arenas.location
+     LIMIT 1`,
+    [reservationId]
+  );
+  const reservation = rows[0] ? sanitizeReservation(rows[0]) : null;
+  if (!reservation) return null;
+  const isParticipant = reservation.participants.some((participant) => Number(participant.userId) === Number(actor?.id));
+  const canAccess =
+    actor?.effective_role === "super_admin" ||
+    (actor?.effective_role === "admin" && actor?.arena_id && Number(actor.arena_id) === Number(reservation.arena_id)) ||
+    Number(reservation.user_id) === Number(actor?.id) ||
+    isParticipant;
+  if (!canAccess) throw new Error("You do not have access to this reservation");
+  return reservation;
 }
 
 export async function createReservation({ userId, courtId, reservationDate, startTime, endTime, qrToken, notes = "", participantEmails = [] }) {
@@ -1290,10 +1430,11 @@ export async function createReservation({ userId, courtId, reservationDate, star
     if (startMinutes < openingMinutes || endMinutes > closingMinutes) throw new Error("Reservation must stay within the arena opening hours");
     if (await hasReservationConflict(courtId, reservationDate, startTime, endTime, client)) throw new Error("This slot is already reserved");
 
-    const guestEmails = participantEmails.map((email) => email.trim().toLowerCase()).filter(Boolean);
+    const guestEmails = participantEmails.map(normalizeEmail).filter(Boolean);
     const uniqueGuestEmails = [...new Set(guestEmails)];
     if (uniqueGuestEmails.length !== guestEmails.length) throw new Error("The same email cannot be used twice in a reservation");
-    if (uniqueGuestEmails.some((email) => email === creator.email.toLowerCase())) throw new Error("The reservation creator is already included automatically");
+    if (uniqueGuestEmails.some((email) => !isValidEmail(email))) throw new Error("Please enter valid participant emails");
+    if (uniqueGuestEmails.some((email) => email === normalizeEmail(creator.email))) throw new Error("The reservation creator is already included automatically");
 
     const totalPlayers = 1 + uniqueGuestEmails.length;
     if (totalPlayers < Number(court.min_players) || totalPlayers > Number(court.max_players)) throw new Error(`This court accepts between ${court.min_players} and ${court.max_players} players`);
@@ -1302,7 +1443,8 @@ export async function createReservation({ userId, courtId, reservationDate, star
     if (uniqueGuestEmails.length) {
       const placeholders = uniqueGuestEmails.map((_, index) => `$${index + 2}`).join(", ");
       const queryResult = await client.query(
-        `SELECT users.id, users.platform_role, users.status AS account_status, arena_memberships.status AS membership_status
+        `SELECT users.id, users.first_name, users.last_name, users.email, users.platform_role,
+                users.status AS account_status, arena_memberships.status AS membership_status
          FROM users
          JOIN arena_memberships ON arena_memberships.user_id = users.id
          WHERE arena_memberships.arena_id = $1
@@ -1311,9 +1453,9 @@ export async function createReservation({ userId, courtId, reservationDate, star
       );
       participantRows = queryResult.rows;
     }
-    if (participantRows.length !== uniqueGuestEmails.length) throw new Error("Every guest participant must already have an active account in this venue");
     const invalid = participantRows.find((participant) => participant.platform_role === "super_admin" || participant.account_status !== "active" || participant.membership_status !== "active");
-    if (invalid) throw new Error("Every guest participant must already have an active account in this venue");
+    if (invalid) throw new Error("Only active player accounts can be linked to a reservation");
+    const participantByEmail = new Map(participantRows.map((participant) => [normalizeEmail(participant.email), participant]));
 
     const created = await client.query(
       `INSERT INTO reservations (user_id, court_id, reservation_date, start_time, end_time, status, qr_token, notes, created_at)
@@ -1322,9 +1464,29 @@ export async function createReservation({ userId, courtId, reservationDate, star
       [userId, courtId, reservationDate, startTime, endTime, qrToken, notes]
     );
     const reservationId = Number(created.rows[0].id);
-    await client.query(`INSERT INTO reservation_participants (reservation_id, user_id, created_at) VALUES ($1, $2, NOW())`, [reservationId, creator.id]);
-    for (const participant of participantRows) {
-      await client.query(`INSERT INTO reservation_participants (reservation_id, user_id, created_at) VALUES ($1, $2, NOW())`, [reservationId, participant.id]);
+    await client.query(
+      `INSERT INTO reservation_participants (reservation_id, user_id, email, display_name, role, slot, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'creator', 1, 'confirmed', NOW(), NOW())`,
+      [reservationId, creator.id, normalizeEmail(creator.email), `${creator.first_name} ${creator.last_name}`.trim()]
+    );
+    for (const [index, email] of uniqueGuestEmails.entries()) {
+      const participant = participantByEmail.get(email);
+      const displayName = participant ? `${participant.first_name} ${participant.last_name}`.trim() : null;
+      const status = participant ? "confirmed" : "pending_account";
+      await client.query(
+        `INSERT INTO reservation_participants (reservation_id, user_id, email, display_name, role, slot, status, invitation_token, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'participant', $5, $6, $7, NOW(), NOW())`,
+        [reservationId, participant?.id ?? null, email, displayName, index + 2, status, participant ? null : randomUUID()]
+      );
+      if (participant?.id) {
+        await createNotification({
+          userId: participant.id,
+          title: "You were added to a reservation",
+          body: `${creator.first_name} ${creator.last_name} added you to ${court.name} on ${reservationDate} from ${startTime} to ${endTime}.`,
+          type: "reservation",
+          linkUrl: `/reservations/${reservationId}`,
+        });
+      }
     }
     await addActivityLog(client, { arenaId: court.arena_id, actorUserId: creator.id, actorName: `${creator.first_name} ${creator.last_name}`, action: "Reservation confirmee", detail: `${court.name} - ${reservationDate} ${startTime}-${endTime}` });
     await client.query("COMMIT");
@@ -1338,14 +1500,18 @@ export async function createReservation({ userId, courtId, reservationDate, star
   }
 }
 
-export async function cancelReservation(id, actor) {
+export async function cancelReservation(id, actor, reason = null) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const { rows } = await client.query(
-      `SELECT reservations.*, courts.arena_id, courts.name AS court_name
+      `SELECT reservations.*, courts.arena_id, courts.name AS court_name,
+              arenas.name AS arena_name,
+              CONCAT(owner.first_name, ' ', owner.last_name) AS owner_name
        FROM reservations
        JOIN courts ON courts.id = reservations.court_id
+       JOIN arenas ON arenas.id = courts.arena_id
+       JOIN users AS owner ON owner.id = reservations.user_id
        WHERE reservations.id = $1
        LIMIT 1`,
       [id]
@@ -1357,7 +1523,7 @@ export async function cancelReservation(id, actor) {
     }
     if (reservation.status === "cancelled") {
       await client.query("ROLLBACK");
-      return { success: true };
+      return { success: true, alreadyCancelled: true, reservation };
     }
     const participants = await client.query("SELECT user_id FROM reservation_participants WHERE reservation_id = $1", [id]);
     const isParticipant = participants.rows.some((p) => Number(p.user_id) === actor.id);
@@ -1368,16 +1534,49 @@ export async function cancelReservation(id, actor) {
       const diffHours = (reservationStart.getTime() - Date.now()) / (1000 * 60 * 60);
       if (diffHours < 24) throw new Error("Reservations can only be cancelled at least 24 hours in advance");
     }
-    const result = await client.query("UPDATE reservations SET status = 'cancelled' WHERE id = $1", [id]);
-    await addActivityLog(client, { arenaId: reservation.arena_id, actorUserId: actor.id, actorName: `${actor.first_name} ${actor.last_name}`, action: canCancelRole ? "Reservation annulee (admin)" : "Reservation annulee", detail: `${reservation.court_name} - ${reservation.reservation_date} ${String(reservation.start_time).slice(0, 5)}` });
+    const actorRole = canCancelRole ? (actor.effective_role === "super_admin" ? "super_admin" : "admin") : "player";
+    const result = await client.query(
+      `UPDATE reservations
+       SET status = 'cancelled',
+           cancelled_at = NOW(),
+           cancelled_by_user_id = $2,
+           cancellation_reason = $3,
+           cancellation_actor_role = $4
+       WHERE id = $1`,
+      [id, actor.id, reason ?? null, actorRole]
+    );
+    // Cancel any linked training sessions and capture coach user id
+    const { rows: sessionRows } = await client.query(
+      `UPDATE training_sessions SET status = 'cancelled'
+       WHERE reservation_id = $1 AND status != 'cancelled'
+       RETURNING id, coach_user_id`,
+      [id]
+    );
+    const cancelledSession = sessionRows[0] ?? null;
+    await addActivityLog(client, {
+      arenaId: reservation.arena_id,
+      actorUserId: actor.id,
+      actorName: `${actor.first_name} ${actor.last_name}`,
+      action: canCancelRole ? "Reservation annulee (admin)" : "Reservation annulee",
+      detail: `${reservation.court_name} - ${reservation.reservation_date} ${String(reservation.start_time).slice(0, 5)}`,
+    });
     await client.query("COMMIT");
-    return { changes: result.rowCount, success: true };
+    return { changes: result.rowCount, success: true, reservation, cancelledSession };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
   } finally {
     client.release();
   }
+}
+
+export async function updateReservationRefund(id, { refundStatus, stripeRefundId = null, refundedAmount = null, refundError = null }) {
+  await pool.query(
+    `UPDATE reservations
+     SET refund_status = $2, stripe_refund_id = $3, refunded_amount = $4, refund_error = $5
+     WHERE id = $1`,
+    [id, refundStatus, stripeRefundId ?? null, refundedAmount ?? null, refundError ?? null]
+  );
 }
 
 export async function listAdminReservations(actor) {
@@ -2182,7 +2381,7 @@ export async function getCompetitionDetails(competitionId) {
   const comp = await pool.query(
     `SELECT competitions.*, arenas.name AS arena_name
      FROM competitions
-     JOIN arenas ON arenas.id = competitions.arena_id
+     LEFT JOIN arenas ON arenas.id = competitions.arena_id
      WHERE competitions.id = $1
      LIMIT 1`,
     [competitionId]
@@ -2190,7 +2389,8 @@ export async function getCompetitionDetails(competitionId) {
   const competition = comp.rows[0];
   if (!competition) return null;
   const participants = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, latest.ranking_score AS ranking
+    `SELECT users.id, users.first_name, users.last_name, latest.ranking_score AS ranking,
+            competition_registrations.registered_at
      FROM competition_registrations
      JOIN users ON users.id = competition_registrations.user_id
      LEFT JOIN (
@@ -2198,20 +2398,122 @@ export async function getCompetitionDetails(competitionId) {
        FROM performance_snapshots
      ) latest ON latest.user_id = users.id AND latest.rn = 1
      WHERE competition_registrations.competition_id = $1
-       AND competition_registrations.status = 'registered'`,
+       AND competition_registrations.status = 'registered'
+     ORDER BY competition_registrations.id ASC`,
     [competitionId]
   );
   return {
     ...sanitizeCompetition(competition),
-    participants: participants.rows.map((p) => ({ id: p.id, name: `${p.first_name} ${p.last_name}`, ranking: Number(p.ranking ?? 1000) })),
-    rules: "Matchs en 2 sets gagnants. Point decisif a 40-40. Super tie-break en cas de 3eme set.",
-    prizes: "1er: 500€ + Trophee | 2eme: 200€ | 3eme: 100€",
+    participants: participants.rows.map((p) => ({
+      id: p.id,
+      name: `${p.first_name} ${p.last_name}`,
+      ranking: Number(p.ranking ?? 1000),
+      registeredAt: toIso(p.registered_at),
+    })),
+    rules: competition.rules ?? null,
+    prizes: competition.prizes ?? null,
   };
+}
+
+export async function createCompetition(actor, { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, rules, prizes }) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const arenaId = actor.effective_role === "super_admin" ? (actor.arena_id ?? null) : actor.arena_id;
+  if (!arenaId) throw new Error("No arena associated with this admin account");
+  const { rows } = await pool.query(
+    `INSERT INTO competitions (arena_id, name, sport, description, start_date, end_date, registration_deadline, location, max_participants, status, rules, prizes, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, NOW())
+     RETURNING *`,
+    [arenaId, name, sport, description ?? null, startDate, endDate ?? null, registrationDeadline ?? null, location, maxParticipants, rules ?? null, prizes ?? null]
+  );
+  return sanitizeCompetition(rows[0]);
+}
+
+export async function updateCompetition(actor, competitionId, { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, status, rules, prizes }) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const existing = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!existing.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(existing.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized to edit this competition");
+  }
+  const { rows } = await pool.query(
+    `UPDATE competitions
+     SET name = COALESCE($2, name),
+         sport = COALESCE($3, sport),
+         description = COALESCE($4, description),
+         start_date = COALESCE($5, start_date),
+         end_date = $6,
+         registration_deadline = $7,
+         location = COALESCE($8, location),
+         max_participants = COALESCE($9, max_participants),
+         status = COALESCE($10, status),
+         rules = $11,
+         prizes = $12
+     WHERE id = $1
+     RETURNING *`,
+    [competitionId, name, sport, description, startDate, endDate ?? null, registrationDeadline ?? null, location, maxParticipants, status, rules ?? null, prizes ?? null]
+  );
+  return sanitizeCompetition(rows[0]);
+}
+
+export async function deleteCompetition(actor, competitionId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const existing = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!existing.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(existing.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized to delete this competition");
+  }
+  await pool.query("DELETE FROM competition_registrations WHERE competition_id = $1", [competitionId]);
+  await pool.query("DELETE FROM competitions WHERE id = $1", [competitionId]);
+  return { success: true };
+}
+
+export async function listCompetitionRegistrations(actor, competitionId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const comp = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!comp.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(comp.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized");
+  }
+  const { rows } = await pool.query(
+    `SELECT cr.id, cr.user_id, cr.status, cr.registered_at,
+            u.first_name, u.last_name, u.email,
+            COALESCE(ps.ranking_score, 1000) AS ranking_score
+     FROM competition_registrations cr
+     JOIN users u ON u.id = cr.user_id
+     LEFT JOIN LATERAL (
+       SELECT ranking_score FROM performance_snapshots WHERE user_id = u.id ORDER BY id DESC LIMIT 1
+     ) ps ON true
+     WHERE cr.competition_id = $1
+     ORDER BY cr.registered_at ASC`,
+    [competitionId]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    firstName: r.first_name,
+    lastName: r.last_name,
+    email: r.email,
+    status: r.status,
+    rankingScore: Number(r.ranking_score),
+    registeredAt: toIso(r.registered_at),
+  }));
+}
+
+export async function removeCompetitionRegistration(actor, competitionId, userId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const comp = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!comp.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(comp.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized");
+  }
+  await pool.query("DELETE FROM competition_registrations WHERE competition_id = $1 AND user_id = $2", [competitionId, userId]);
+  return { success: true };
 }
 export async function getReservationTicketDetails(reservationId, actor) {
   const details = await pool.query(
     `SELECT reservations.id, reservations.reservation_date, reservations.start_time, reservations.end_time,
             reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+            reservations.payment_status, reservations.payment_amount, reservations.payment_currency,
             courts.name AS court_name, courts.sport, arenas.id AS arena_id, arenas.name AS arena_name, arenas.location AS arena_location,
             owner.first_name AS owner_first_name, owner.last_name AS owner_last_name
      FROM reservations
@@ -2226,18 +2528,21 @@ export async function getReservationTicketDetails(reservationId, actor) {
   if (!reservation) throw new Error("Reservation not found");
 
   const participantsQuery = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, users.email
+    `SELECT reservation_participants.id, reservation_participants.user_id,
+            reservation_participants.email, reservation_participants.display_name,
+            reservation_participants.status, reservation_participants.role,
+            users.first_name, users.last_name, users.email AS user_email
      FROM reservation_participants
-     JOIN users ON users.id = reservation_participants.user_id
+     LEFT JOIN users ON users.id = reservation_participants.user_id
      WHERE reservation_participants.reservation_id = $1
-     ORDER BY users.first_name ASC, users.last_name ASC`,
+     ORDER BY COALESCE(reservation_participants.slot, 999), reservation_participants.id`,
     [reservationId]
   );
   const participants = participantsQuery.rows;
   const canAccess =
     actor?.effective_role === "super_admin" ||
     (actor?.effective_role === "admin" && actor?.arena_id && Number(actor.arena_id) === Number(reservation.arena_id)) ||
-    participants.some((participant) => Number(participant.id) === Number(actor?.id));
+    participants.some((participant) => Number(participant.user_id) === Number(actor?.id));
   if (!canAccess) throw new Error("You do not have access to this reservation ticket");
 
   const payload = `${reservation.id}|${reservation.qr_token}|${String(reservation.reservation_date).slice(0, 10)}|${String(reservation.start_time).slice(0, 8)}|${String(reservation.end_time).slice(0, 8)}`;
@@ -2249,6 +2554,9 @@ export async function getReservationTicketDetails(reservationId, actor) {
     startTime: String(reservation.start_time).slice(0, 5),
     endTime: String(reservation.end_time).slice(0, 5),
     status: reservation.status,
+    paymentStatus: reservation.payment_status ?? "paid",
+    paymentAmount: reservation.payment_amount,
+    paymentCurrency: reservation.payment_currency ?? "TND",
     qrToken: reservation.qr_token,
     notes: reservation.notes ?? "",
     createdAt: toIso(reservation.created_at),
@@ -2257,7 +2565,13 @@ export async function getReservationTicketDetails(reservationId, actor) {
     arenaName: reservation.arena_name,
     arenaLocation: reservation.arena_location,
     ownerName: `${reservation.owner_first_name} ${reservation.owner_last_name}`,
-    participants: participants.map((participant) => ({ id: participant.id, name: `${participant.first_name} ${participant.last_name}`, email: participant.email })),
+    participants: participants.map((participant) => ({
+      id: participant.user_id,
+      name: participant.display_name ?? `${participant.first_name ?? ""} ${participant.last_name ?? ""}`.trim() ?? participant.email,
+      email: participant.email ?? participant.user_email,
+      status: participant.status,
+      role: participant.role,
+    })),
     signature,
     specialCode,
   };
@@ -2267,6 +2581,7 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
   const details = await pool.query(
     `SELECT reservations.id, reservations.reservation_date, reservations.start_time, reservations.end_time,
             reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+            reservations.payment_status, reservations.payment_amount, reservations.payment_currency,
             courts.name AS court_name, courts.sport, arenas.name AS arena_name, arenas.location AS arena_location,
             owner.first_name AS owner_first_name, owner.last_name AS owner_last_name
      FROM reservations
@@ -2280,12 +2595,16 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
   );
   const reservation = details.rows[0];
   if (!reservation) throw new Error("Invalid ticket link or reservation");
+  if (reservation.payment_status !== "paid") throw new Error("Payment required");
   const participantsQuery = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, users.email
+    `SELECT reservation_participants.id, reservation_participants.user_id,
+            reservation_participants.email, reservation_participants.display_name,
+            reservation_participants.status, reservation_participants.role,
+            users.first_name, users.last_name, users.email AS user_email
      FROM reservation_participants
-     JOIN users ON users.id = reservation_participants.user_id
+     LEFT JOIN users ON users.id = reservation_participants.user_id
      WHERE reservation_participants.reservation_id = $1
-     ORDER BY users.first_name ASC, users.last_name ASC`,
+     ORDER BY COALESCE(reservation_participants.slot, 999), reservation_participants.id`,
     [reservationId]
   );
   const payload = `${reservation.id}|${reservation.qr_token}|${String(reservation.reservation_date).slice(0, 10)}|${String(reservation.start_time).slice(0, 8)}|${String(reservation.end_time).slice(0, 8)}`;
@@ -2297,6 +2616,9 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
     startTime: String(reservation.start_time).slice(0, 5),
     endTime: String(reservation.end_time).slice(0, 5),
     status: reservation.status,
+    paymentStatus: reservation.payment_status ?? "paid",
+    paymentAmount: reservation.payment_amount,
+    paymentCurrency: reservation.payment_currency ?? "TND",
     qrToken: reservation.qr_token,
     notes: reservation.notes ?? "",
     createdAt: toIso(reservation.created_at),
@@ -2305,7 +2627,13 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
     arenaName: reservation.arena_name,
     arenaLocation: reservation.arena_location,
     ownerName: `${reservation.owner_first_name} ${reservation.owner_last_name}`,
-    participants: participantsQuery.rows.map((participant) => ({ id: participant.id, name: `${participant.first_name} ${participant.last_name}`, email: participant.email })),
+    participants: participantsQuery.rows.map((participant) => ({
+      id: participant.user_id,
+      name: participant.display_name ?? `${participant.first_name ?? ""} ${participant.last_name ?? ""}`.trim() ?? participant.email,
+      email: participant.email ?? participant.user_email,
+      status: participant.status,
+      role: participant.role,
+    })),
     signature,
     specialCode,
   };
@@ -2357,46 +2685,105 @@ function loadUltimaLogoJpeg() {
 }
 
 export function generateReservationTicketPdfBuffer(ticket) {
-  const line = (text = "") => String(text).replace(/[()]/g, "").slice(0, 110);
-  const participants = (ticket.participants || []).slice(0, 8).map((participant, index) => `${index + 1}. ${participant.name} <${participant.email}>`);
+  const line = (text = "") => String(text).replace(/[()\\]/g, "").slice(0, 96);
+  const participantStatus = (status) => status === "pending_account" ? "Pending account" : status === "invited" ? "Invited" : status === "cancelled" ? "Cancelled" : "Confirmed";
+  const participants = (ticket.participants || []).slice(0, 10).map((participant, index) => {
+    const role = participant.role === "creator" ? "Creator" : `Participant ${index + 1}`;
+    return `${role}: ${participant.name || participant.email} - ${participant.email} - ${participantStatus(participant.status)}`;
+  });
   const specialCode = ticket.specialCode || `ULT-${ticket.id}-${ticket.signature.slice(0, 8)}`;
   const qrPayload = `ULTIMA|TICKET|${ticket.id}|${ticket.qrToken}|${specialCode}`;
-  const contentLines = [
-    `Ticket ID: #${ticket.id}`,
-    `Arena: ${ticket.arenaName} (${ticket.arenaLocation || "N/A"})`,
-    `Court: ${ticket.courtName} - ${ticket.sport}`,
-    `Date: ${ticket.reservationDate}`,
-    `Time: ${ticket.startTime} - ${ticket.endTime}`,
-    `Status: ${ticket.status}`,
-    `Owner: ${ticket.ownerName}`,
-    `QR Token: ${ticket.qrToken}`,
-    "",
-    "Participants:",
-    ...participants,
-    "",
-    `Notes: ${ticket.notes || "N/A"}`,
-    "",
-    `Special Verification Code: ${specialCode}`,
-    `Digital Signature: ${ticket.signature}`,
-    `Generated At: ${new Date().toISOString()}`,
+  const durationMinutes = (() => {
+    const [sh, sm] = String(ticket.startTime).split(":").map(Number);
+    const [eh, em] = String(ticket.endTime).split(":").map(Number);
+    if (![sh, sm, eh, em].every(Number.isFinite)) return "N/A";
+    return `${(eh * 60 + em) - (sh * 60 + sm)} min`;
+  })();
+  const paymentAmount = ticket.paymentAmount ? `${Number(ticket.paymentAmount).toFixed(3)} ${ticket.paymentCurrency || "TND"}` : "Paid via Stripe";
+  const card = (x, y, w, h) => [
+    "1 1 1 rg", `${x} ${y} ${w} ${h} re`, "f",
+    "0.86 0.88 0.93 RG", "0.8 w", `${x} ${y} ${w} ${h} re`, "S",
   ];
-  const stream = ["0.88 0.84 0.98 rg", "0 0 595 842 re", "f", "0.08 0.06 0.16 rg", "0 760 595 82 re", "f", "0.16 0.12 0.3 rg", "BT", "/F1 26 Tf", "120 798 Td", "(ULTIMA RESERVATION PASS) Tj", "ET", "q", "74 0 0 54 42 772 cm", "/Im1 Do", "Q", "0.16 0.12 0.3 rg", "BT", "/F1 11 Tf", "50 730 Td", "14 TL"];
-  for (let index = 0; index < contentLines.length; index += 1) {
-    const text = line(contentLines[index]);
-    if (index === 0) stream.push(`(${text}) Tj`);
-    else {
-      stream.push("T*");
-      stream.push(`(${text}) Tj`);
-    }
-  }
-  stream.push("ET", "0.24 0.22 0.35 RG", "2 w", "40 50 515 740 re", "S", ...buildQrPdfCommands(qrPayload, 430, 74, 112), "0.16 0.12 0.3 rg", "BT", "/F1 8 Tf", "430 62 Td", "(Reservation QR - scan to verify) Tj", "ET");
+  const text = (x, y, value, size = 10, font = "F2", color = "0.10 0.13 0.22") => [
+    `${color} rg`, "BT", `/${font} ${size} Tf`, `${x} ${y} Td`, `(${line(value)}) Tj`, "ET",
+  ];
+  const pill = (x, y, w, label) => [
+    "0.98 0.78 0.22 rg", `${x} ${y} ${w} 24 re`, "f",
+    ...text(x + 12, y + 8, label, 8, "F1", "0.05 0.07 0.14"),
+  ];
+  const rows = [
+    ["ARENA", ticket.arenaName],
+    ["LOCATION", ticket.arenaLocation || "N/A"],
+    ["COURT", `${ticket.courtName} - ${ticket.sport}`],
+    ["DATE", ticket.reservationDate],
+    ["TIME", `${ticket.startTime} - ${ticket.endTime}`],
+    ["DURATION", durationMinutes],
+    ["BOOKED BY", ticket.ownerName],
+    ["PAYMENT", `${ticket.paymentStatus || "paid"} - ${paymentAmount}`],
+  ];
+
+  const stream = [
+    "0.04 0.06 0.13 rg", "0 0 595 842 re", "f",
+    "0.07 0.10 0.20 rg", "26 26 543 790 re", "f",
+    "0.98 0.78 0.22 rg", "26 26 6 790 re", "f",
+    "0.12 0.16 0.28 rg", "52 56 491 720 re", "f",
+    "1 1 1 rg", "52 56 491 720 re", "f",
+    "0.05 0.07 0.14 rg", "52 654 491 122 re", "f",
+    "0.98 0.78 0.22 rg", "52 654 491 5 re", "f",
+    "q", "76 0 0 56 74 692 cm", "/Im1 Do", "Q",
+    ...text(160, 730, "ULTIMA COURT PASS", 26, "F1", "1 1 1"),
+    ...text(162, 710, "Paid reservation ticket with SmartPlay-ready details", 9, "F2", "0.78 0.83 0.92"),
+    ...pill(418, 710, 94, "STRIPE PAID"),
+    ...text(74, 628, `Reservation #${ticket.id}`, 19, "F1"),
+    ...text(74, 608, `${ticket.status} court reservation`, 9, "F2", "0.38 0.43 0.53"),
+    ...card(74, 500, 280, 88),
+    ...text(92, 560, "MATCH WINDOW", 8, "F1", "0.48 0.52 0.62"),
+    ...text(92, 538, ticket.reservationDate, 17, "F1"),
+    ...text(92, 518, `${ticket.startTime} - ${ticket.endTime}   (${durationMinutes})`, 10, "F2", "0.24 0.28 0.38"),
+    ...card(74, 390, 280, 88),
+    ...text(92, 450, "VENUE", 8, "F1", "0.48 0.52 0.62"),
+    ...text(92, 428, ticket.arenaName, 15, "F1"),
+    ...text(92, 410, `${ticket.courtName} - ${ticket.sport}`, 10, "F2", "0.24 0.28 0.38"),
+    ...card(374, 390, 138, 198),
+    "0.98 0.78 0.22 rg", "388 526 110 110 re", "f",
+    "1 1 1 rg", "394 532 98 98 re", "f",
+    ...buildQrPdfCommands(qrPayload, 400, 538, 86),
+    ...text(394, 508, "SCAN TO VERIFY", 8, "F1"),
+    ...text(390, 492, "QR appears only after", 7, "F2", "0.38 0.43 0.53"),
+    ...text(392, 480, "Stripe payment is paid.", 7, "F2", "0.38 0.43 0.53"),
+    ...card(74, 252, 438, 110),
+    ...text(92, 334, "PARTICIPANTS", 9, "F1", "0.48 0.52 0.62"),
+  ];
+  const participantLines = participants.length ? participants.slice(0, 6) : ["No participants listed"];
+  participantLines.forEach((participant, index) => {
+    stream.push(...text(92, 314 - index * 15, participant, 8, "F2"));
+  });
+  if (participants.length > 6) stream.push(...text(92, 314 - 6 * 15, `+${participants.length - 6} more participants`, 8, "F2", "0.38 0.43 0.53"));
+
+  stream.push(
+    ...card(74, 126, 438, 94),
+    ...text(92, 194, "RESERVATION DETAILS", 9, "F1", "0.48 0.52 0.62"),
+  );
+  rows.forEach(([label, value], index) => {
+    const x = index % 2 === 0 ? 92 : 292;
+    const y = 174 - Math.floor(index / 2) * 24;
+    stream.push(...text(x, y + 10, label, 6, "F1", "0.52 0.56 0.66"));
+    stream.push(...text(x, y, value, 8, "F2"));
+  });
+
+  stream.push(
+    "0.05 0.07 0.14 rg", "74 76 438 30 re", "f",
+    ...text(92, 92, `VERIFY: ${specialCode}`, 9, "F1", "1 1 1"),
+    ...text(310, 92, `SIGNATURE: ${ticket.signature}`, 6, "F2", "0.78 0.83 0.92"),
+    ...text(74, 42, `Generated ${new Date().toISOString()} - ULTIMA SmartPlay Arena Platform`, 7, "F2", "0.78 0.83 0.92")
+  );
   const contentStream = `${stream.join("\n")}\n`;
   const contentLength = Buffer.byteLength(contentStream, "utf8");
   const logo = loadUltimaLogoJpeg();
   const objects = [];
   objects.push(Buffer.from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n", "utf8"));
   objects.push(Buffer.from("2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n", "utf8"));
-  objects.push(Buffer.from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>\nendobj\n", "utf8"));
+  objects.push(Buffer.from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 7 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>\nendobj\n", "utf8"));
   objects.push(Buffer.from("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n", "utf8"));
   objects.push(Buffer.from(`5 0 obj\n<< /Length ${contentLength} >>\nstream\n${contentStream}endstream\nendobj\n`, "utf8"));
   if (logo) {
@@ -2406,6 +2793,7 @@ export function generateReservationTicketPdfBuffer(ticket) {
   } else {
     objects.push(Buffer.from("6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\xFF\xFF\xFF\nendstream\nendobj\n", "binary"));
   }
+  objects.push(Buffer.from("7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n", "utf8"));
   let offset = Buffer.byteLength("%PDF-1.4\n", "utf8");
   const xrefOffsets = [0];
   for (const object of objects) {
@@ -2793,7 +3181,7 @@ export async function listCompetitions(actor = null) {
   const { rows } = await pool.query(
     `SELECT competitions.*, arenas.name AS arena_name, COUNT(competition_registrations.id)::int AS participants
      FROM competitions
-     JOIN arenas ON arenas.id = competitions.arena_id
+     LEFT JOIN arenas ON arenas.id = competitions.arena_id
      LEFT JOIN competition_registrations
        ON competition_registrations.competition_id = competitions.id
       AND competition_registrations.status = 'registered'
@@ -3820,6 +4208,9 @@ function normalizeCoachProfile(row) {
     currency: row.currency ?? "TND",
     isActive: row.is_active ?? true,
     isVerified: row.is_verified ?? false,
+    maxSessionsPerDay: row.max_sessions_per_day ?? null,
+    sessionDurationMinutes: row.session_duration_minutes ?? 60,
+    cooldownMinutes: row.cooldown_minutes ?? 0,
     userStatus: row.user_status ?? null,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
@@ -3904,6 +4295,7 @@ export async function upsertCoachProfile(actorUserId, targetCoachUserId, data) {
     arenaId, profileImageUrl, headline, bio,
     expertise, qualities, certifications, previousWorkplaces,
     languages, yearsExperience, hourlyRate, currency, isActive, isVerified,
+    maxSessionsPerDay, sessionDurationMinutes, cooldownMinutes,
   } = data;
 
   const safeArenaId = arenaId !== undefined ? (arenaId ? Number(arenaId) : null) : (actor.arena_id ?? null);
@@ -3927,6 +4319,9 @@ export async function upsertCoachProfile(actorUserId, targetCoachUserId, data) {
     if (currency !== undefined) set("currency", String(currency || "TND").trim());
     if (isActive !== undefined && isAdminLike(actor)) set("is_active", Boolean(isActive));
     if (isVerified !== undefined && isAdminLike(actor)) set("is_verified", Boolean(isVerified));
+    if (maxSessionsPerDay !== undefined) set("max_sessions_per_day", maxSessionsPerDay !== null ? Math.max(1, Number(maxSessionsPerDay)) : null);
+    if (sessionDurationMinutes !== undefined) set("session_duration_minutes", Math.max(15, Number(sessionDurationMinutes) || 60));
+    if (cooldownMinutes !== undefined) set("cooldown_minutes", Math.max(0, Number(cooldownMinutes) || 0));
     fields.push("updated_at = NOW()");
     if (!params.length) return getCoachProfile(targetCoachUserId);
     params.push(Number(targetCoachUserId));
@@ -4018,7 +4413,7 @@ export async function getCoachPublicProfile(coachUserId) {
 // ── Availability ──────────────────────────────────────────────────────────────
 
 export async function getCoachAvailability(coachUserId) {
-  const [rulesRes, excRes] = await Promise.all([
+  const [rulesRes, excRes, profileRes] = await Promise.all([
     pool.query(
       `SELECT * FROM coach_availability_rules WHERE coach_user_id = $1 ORDER BY day_of_week, start_time`,
       [Number(coachUserId)]
@@ -4027,7 +4422,12 @@ export async function getCoachAvailability(coachUserId) {
       `SELECT * FROM coach_availability_exceptions WHERE coach_user_id = $1 AND exception_date >= CURRENT_DATE ORDER BY exception_date`,
       [Number(coachUserId)]
     ),
+    pool.query(
+      `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+      [Number(coachUserId)]
+    ),
   ]);
+  const p = profileRes.rows[0];
   return {
     rules: rulesRes.rows.map((r) => ({
       id: r.id, dayOfWeek: r.day_of_week,
@@ -4041,6 +4441,11 @@ export async function getCoachAvailability(coachUserId) {
       endTime: r.end_time ? String(r.end_time).slice(0, 5) : null,
       isAvailable: r.is_available, reason: r.reason ?? null,
     })),
+    sessionLimits: {
+      maxSessionsPerDay: p?.max_sessions_per_day ?? null,
+      sessionDurationMinutes: p?.session_duration_minutes ?? 60,
+      cooldownMinutes: p?.cooldown_minutes ?? 0,
+    },
   };
 }
 
@@ -4085,10 +4490,9 @@ export async function addCoachAvailabilityException(coachUserId, { date, startTi
 
 export async function getCoachAvailableSlots(coachUserId, date) {
   if (!date) throw new Error("date is required");
-  const SLOT = 60;
   const d = new Date(date + "T00:00:00Z");
   const dow = d.getUTCDay();
-  const [rulesRes, excRes, sessRes] = await Promise.all([
+  const [rulesRes, excRes, sessRes, profileRes] = await Promise.all([
     pool.query(
       `SELECT start_time, end_time FROM coach_availability_rules
        WHERE coach_user_id = $1 AND day_of_week = $2 AND is_available = true ORDER BY start_time`,
@@ -4104,7 +4508,18 @@ export async function getCoachAvailableSlots(coachUserId, date) {
        WHERE coach_user_id = $1 AND session_date = $2::date AND status = 'scheduled'`,
       [Number(coachUserId), date]
     ),
+    pool.query(
+      `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+      [Number(coachUserId)]
+    ),
   ]);
+  const p = profileRes.rows[0];
+  const SLOT = Math.max(15, Number(p?.session_duration_minutes) || 60);
+  const maxPerDay = p?.max_sessions_per_day ? Number(p.max_sessions_per_day) : null;
+  const cooldown = Math.max(0, Number(p?.cooldown_minutes) || 0);
+
+  if (maxPerDay !== null && sessRes.rows.length >= maxPerDay) return [];
+
   let baseSlots;
   if (excRes.rows.length > 0) {
     const exc = excRes.rows[0];
@@ -4114,9 +4529,10 @@ export async function getCoachAvailableSlots(coachUserId, date) {
     baseSlots = rulesRes.rows;
   }
   if (!baseSlots.length) return [];
+
   const booked = sessRes.rows.map((s) => ({
     start: timeToMinutes(String(s.start_time).slice(0, 5)),
-    end: timeToMinutes(String(s.end_time).slice(0, 5)),
+    end: timeToMinutes(String(s.end_time).slice(0, 5)) + cooldown,
   }));
   const slots = [];
   for (const base of baseSlots) {

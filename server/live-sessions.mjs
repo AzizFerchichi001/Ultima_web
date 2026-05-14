@@ -81,6 +81,11 @@ export async function canViewLiveSession(actor, session) {
     );
     return rows.length > 0;
   }
+  // Dev/demo sessions are viewable by any authenticated user
+  const sessionMode = String(session.mode ?? "").toLowerCase();
+  const cameraType = String(session.cameraType ?? session.camera_type ?? "").toLowerCase();
+  if (["mock", "file_demo", "local_demo"].includes(sessionMode) || cameraType === "file_demo") return true;
+
   const role = actor.effective_role ?? actor.role;
   if (["admin", "super_admin"].includes(role)) {
     return canManageLiveSession(actor, session.arena_id ?? session.arenaId);
@@ -429,6 +434,20 @@ export async function getLiveSessionById(id) {
       name: row.first_name ? `${row.first_name} ${row.last_name ?? ""}`.trim() : row.email ?? row.slot,
     })),
   };
+}
+
+export async function deleteLiveSession(sessionId) {
+  await pool.query("DELETE FROM live_sessions WHERE id = $1", [toNumber(sessionId)]);
+}
+
+export async function patchLiveSession(sessionId, updates) {
+  const fields = [];
+  const vals = [];
+  if (updates.mode !== undefined) { vals.push(updates.mode); fields.push(`mode = $${vals.length}`); }
+  if (updates.courtId !== undefined) { vals.push(Number(updates.courtId)); fields.push(`court_id = $${vals.length}`); }
+  if (!fields.length) return;
+  vals.push(toNumber(sessionId));
+  await pool.query(`UPDATE live_sessions SET ${fields.join(", ")}, updated_at = NOW() WHERE id = $${vals.length}`, vals);
 }
 
 export async function updateLiveSessionStatus({ sessionId, status, message = null, aiSessionId = null, fps = null, lastFrame = null, stopped = false }) {

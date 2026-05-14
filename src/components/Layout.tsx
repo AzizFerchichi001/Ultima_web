@@ -1,5 +1,6 @@
 import { Component, ErrorInfo, ReactNode, lazy, Suspense, useEffect } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ArrowLeft } from "lucide-react";
 import Navbar from "./Navbar";
 import Footer from "./Footer";
 
@@ -32,9 +33,13 @@ class SceneErrorBoundary extends Component<{ children: ReactNode }, { hasError: 
   }
 }
 
+const NO_BACK = ["/", "/login", "/signup", "/about-us", "/reset-password", "/verify-email", "/payment/success", "/payment/cancel"];
+
 const Layout = ({ children }: { children: ReactNode }) => {
   const location = useLocation();
+  const navigate = useNavigate();
   const shouldRenderScene = ["/", "/about-us"].includes(location.pathname);
+  const showBack = !NO_BACK.includes(location.pathname) && window.history.length > 1;
 
   useEffect(() => {
     const onPointerOutUi = (event: MouseEvent) => {
@@ -73,7 +78,19 @@ const Layout = ({ children }: { children: ReactNode }) => {
         </SceneErrorBoundary>
       )}
       <Navbar />
-      <main className="app-content-3d flex-1 pt-16" key={location.pathname}>{children}</main>
+      <main className="app-content-3d flex-1 pt-16" key={location.pathname}>
+        {showBack && (
+          <div className="max-w-7xl mx-auto px-4 pt-4">
+            <button
+              onClick={() => navigate(-1)}
+              className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft size={14} /> Back
+            </button>
+          </div>
+        )}
+        {children}
+      </main>
       <Footer />
     </div>
   );

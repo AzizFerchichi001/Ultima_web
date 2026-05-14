@@ -1,11 +1,6 @@
 import { Camera, CircleDot } from "lucide-react";
 import type { LiveVisualUpdate } from "./liveTypes";
 
-function pct(value: number | undefined) {
-  if (typeof value !== "number" || Number.isNaN(value)) return "50%";
-  return `${Math.max(0, Math.min(1, value)) * 100}%`;
-}
-
 export default function LiveVideoPanel({
   update,
   cameraName,
@@ -17,10 +12,17 @@ export default function LiveVideoPanel({
   videoUrl?: string | null;
   renderedUrl?: string | null;
 }) {
-  const players = update?.players ?? [];
+  const playerCount = update?.players?.length ?? update?.pose?.trackedPlayers ?? null;
+  const ballTracked = update?.ball != null && (
+    (update.ball.x != null && update.ball.y != null) ||
+    update.ball.confidence != null ||
+    update.ball.image != null
+  );
+
   return (
     <div className="relative aspect-video overflow-hidden rounded-lg border border-border bg-zinc-950">
       {renderedUrl ? (
+        /* FastAPI rendered stream — visualization script output with all annotations */
         <img
           key={renderedUrl}
           src={renderedUrl}
@@ -28,6 +30,7 @@ export default function LiveVideoPanel({
           alt="Rendered SmartPlay live analysis"
         />
       ) : videoUrl ? (
+        /* Source video — raw feed, no overlays (AI output shown in minimap + telemetry) */
         <video
           key={videoUrl}
           src={videoUrl}
@@ -40,35 +43,30 @@ export default function LiveVideoPanel({
       ) : (
         <div className="absolute inset-0 bg-[linear-gradient(135deg,rgba(245,200,66,0.12),transparent_45%),radial-gradient(circle_at_center,rgba(16,185,129,0.18),transparent_42%)]" />
       )}
+
+      {/* Camera label */}
       <div className="absolute left-4 top-4 flex items-center gap-2 rounded-lg border border-white/10 bg-black/50 px-3 py-2 text-xs font-bold uppercase tracking-widest text-white/80">
-        <Camera size={14} /> {renderedUrl ? "Rendered AI live" : (cameraName ?? "Live camera")}
+        <Camera size={14} />
+        {renderedUrl ? "Rendered AI live" : (cameraName ?? "Live camera")}
       </div>
-      {!renderedUrl && players.map((player, index) => (
-          <div
-            key={player.trackId ?? index}
-            className={`absolute rounded-md border-2 ${player.team === "B" ? "border-sky-300" : "border-amber-300"}`}
-            style={{
-              left: pct(player.bbox?.x),
-              top: pct(player.bbox?.y),
-              width: pct(player.bbox?.w ?? 0.06),
-              height: pct(player.bbox?.h ?? 0.16),
-            }}
-          >
-            <span className={`absolute -top-6 left-0 rounded px-2 py-0.5 text-[10px] font-bold ${player.team === "B" ? "bg-sky-400 text-sky-950" : "bg-amber-300 text-amber-950"}`}>
-              {player.label ?? player.trackId ?? `P${index + 1}`}
-            </span>
-          </div>
-        ))}
-      {!renderedUrl && update?.ball && (
-          <div
-            className="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_0_18px_rgba(255,255,255,0.9)]"
-            style={{ left: pct(update.ball.x), top: pct(update.ball.y) }}
-          />
-        )}
+
+      {/* Status bar */}
       <div className="absolute bottom-4 left-4 flex items-center gap-2 rounded-lg bg-black/45 px-3 py-2 text-xs text-white/70">
         <CircleDot size={12} className={update ? "text-red-400 animate-pulse" : "text-muted-foreground"} />
-        Frame {update?.frame ?? "-"} · players {players.length} · ball {update?.ball ? "tracked" : "waiting"}
+        Frame {update?.frame ?? "-"}
+        {update?.fps != null && (
+          <span className="ml-1 font-mono text-emerald-300">{Math.round(update.fps as number)} fps</span>
+        )}
+        {" · "}players {playerCount ?? 0}
+        {" · "}ball {ballTracked ? "tracked" : "waiting"}
       </div>
+
+      {/* No rendered stream banner — only shown when source video plays without annotations */}
+      {!renderedUrl && videoUrl && !update && (
+        <div className="absolute inset-x-4 bottom-16 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/80">
+          AI pipeline starting — annotated stream available once SmartPlay AI service is connected.
+        </div>
+      )}
     </div>
   );
 }

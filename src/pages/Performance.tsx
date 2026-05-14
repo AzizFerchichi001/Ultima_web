@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useSearchParams } from "react-router-dom";
 import Layout from "@/components/Layout";
 import {
   BarChart3, Trophy, Zap,
@@ -46,6 +46,11 @@ type SmartPlayClip = {
 
 // ── Section Tabs ──────────────────────────────────────────────────────────────
 
+const toCurrencyAmount = (value: unknown) => {
+  const amount = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(amount) ? amount : null;
+};
+
 const sections = [
   { id: "reservations", label: "Reservations", icon: Calendar },
   { id: "competitions", label: "Competitions", icon: Trophy },
@@ -64,6 +69,7 @@ const ReservationCard = ({ res, expanded, onToggle }: {
   const [downloading, setDownloading] = useState(false);
   const isPaid = res.payment_status === "paid";
   const isCoaching = res.booking_type === "coaching_session";
+  const price = toCurrencyAmount(res.total_price ?? res.amount);
 
   useEffect(() => {
     if (!expanded || !isPaid) return;
@@ -131,9 +137,9 @@ const ReservationCard = ({ res, expanded, onToggle }: {
           <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${
             isPaid ? "bg-green-500/15 text-green-300" : "bg-amber-500/15 text-amber-300"
           }`}>{isPaid ? "Paid" : res.payment_status ?? "pending"}</span>
-          {(res.total_price || res.amount) && (
+          {price !== null && (
             <span className="text-xs font-bold text-primary">
-              {(res.total_price ?? res.amount ?? 0).toFixed(3)} {res.currency ?? "TND"}
+              {price.toFixed(3)} {res.currency ?? "TND"}
             </span>
           )}
         </div>
@@ -238,8 +244,10 @@ const ReservationCard = ({ res, expanded, onToggle }: {
 
 const Performance = () => {
   const user = getSessionUser();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
-  const initialTab = sections.some((s) => s.id === searchParams.get("tab")) ? searchParams.get("tab")! : "reservations";
+  const routeTab = location.pathname.endsWith("/ai") ? "smartplay" : location.pathname.endsWith("/competitions") ? "competitions" : "reservations";
+  const initialTab = sections.some((s) => s.id === searchParams.get("tab")) ? searchParams.get("tab")! : routeTab;
   const [tab, setTab] = useState(initialTab);
   const [reservations, setReservations] = useState<ReservationRecord[]>([]);
   const [competitions, setCompetitions] = useState<CompetitionRecord[]>([]);
@@ -460,7 +468,7 @@ const Performance = () => {
               <div className="text-center py-16">
                 <Trophy size={48} className="text-muted-foreground mx-auto mb-4" />
                 <p className="text-muted-foreground">You haven't joined any competitions yet.</p>
-                <Button variant="outline" className="mt-4" onClick={() => window.location.href = "/competitions"}>
+                <Button variant="outline" className="mt-4" onClick={() => window.location.href = "/player/competitions"}>
                   Browse Competitions
                 </Button>
               </div>

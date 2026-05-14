@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -16,20 +16,21 @@ const Signup = () => {
     prenom: "",
     email: "",
     password: "",
-    cinNumber: "",
   });
   const [confirmPassword, setConfirmPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
   const { t } = useLocale();
+
+  const redirectTarget = new URLSearchParams(location.search).get("redirect");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim().toLowerCase());
     const passwordOk = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(form.password);
-    const cinOk = /^\d{8}$/.test(form.cinNumber.trim());
     if (!emailOk) {
       toast.error("Please enter a valid email address.");
       return;
@@ -42,49 +43,24 @@ const Signup = () => {
       toast.error("Password confirmation does not match.");
       return;
     }
-    if (!cinOk) {
-      toast.error("CIN must contain exactly 8 digits.");
-      return;
-    }
     setLoading(true);
 
     try {
       const result = await api<{
-        token?: string;
-        user?: Parameters<typeof setSession>[1];
-        requiresEmailVerification?: boolean;
-        message?: string;
-        verificationCode?: string;
-        verificationLink?: string;
+        token: string;
+        user: Parameters<typeof setSession>[1];
       }>("/api/auth/signup", {
         method: "POST",
         body: JSON.stringify(form),
       });
 
-      if (result.token && result.user) {
-        setSession(result.token, result.user);
-        toast.success("Account created successfully.");
-        navigate(["admin", "super_admin"].includes(result.user.role) ? "/admin" : result.user.role === "coach" ? "/coach" : "/reservation");
-        return;
-      }
-
-      toast.success(result.message ?? "Account created. Check your email to verify your account.");
-      if (result.verificationCode) {
-        toast.message(`Dev code: ${result.verificationCode}`);
-      }
-      if (result.verificationLink) {
-        toast.message(`Dev link: ${result.verificationLink}`);
-      }
-      const params = new URLSearchParams({
-        email: form.email.trim().toLowerCase(),
-      });
-      if (result.verificationCode) {
-        params.set("code", result.verificationCode);
-      }
-      if (result.verificationLink) {
-        params.set("devLink", result.verificationLink);
-      }
-      navigate(`/verify-email?${params.toString()}`);
+      setSession(result.token, result.user);
+      toast.success("Account created successfully.");
+      const defaultPath =
+        ["admin", "super_admin"].includes(result.user.role) ? "/admin" :
+        result.user.role === "coach" ? "/coach" :
+        "/reservation";
+      navigate(redirectTarget ?? defaultPath, { replace: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unable to sign up.");
     } finally {
@@ -155,18 +131,6 @@ const Signup = () => {
                   {showConfirmPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                 </button>
               </div>
-            </div>
-            <div>
-              <Label>CIN</Label>
-              <Input
-                inputMode="numeric"
-                pattern="\d{8}"
-                placeholder="14533520"
-                value={form.cinNumber}
-                onChange={(e) => setForm({ ...form, cinNumber: e.target.value.replace(/[^\d]/g, "").slice(0, 8) })}
-                required
-                className="mt-1.5"
-              />
             </div>
             <Button type="submit" className="w-full glow-yellow" disabled={loading}>
               <UserPlus size={18} className="mr-2" /> {loading ? t("auth.signup.loading") : t("auth.signup.submit")}

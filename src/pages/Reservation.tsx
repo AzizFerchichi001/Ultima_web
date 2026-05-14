@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
-  Calendar, MapPin, QrCode, CheckCircle, ArrowRight, Users, Search,
+  Calendar, MapPin, CheckCircle, ArrowRight, Users, Search,
   Building2, Sun, Zap, ChevronLeft, CreditCard, Clock,
   Loader2, CheckCircle2, XCircle, AlertTriangle, Layers, Eye,
 } from "lucide-react";
@@ -60,7 +60,17 @@ type Terrain = {
   availabilityReason?: string;
 };
 
-type Participant = { id: number; firstName: string; lastName: string; email: string };
+type ParticipantStatus = "creator" | "confirmed" | "invited" | "pending_account" | "cancelled";
+type Participant = {
+  id?: number;
+  userId?: number | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  displayName?: string | null;
+  email: string;
+  status?: ParticipantStatus;
+  role?: "creator" | "participant";
+};
 
 type ReservationResult = {
   id: number;
@@ -91,6 +101,8 @@ const TIME_SLOTS = Array.from({ length: 32 }, (_, i) => {
 
 const today = new Date(); today.setHours(0, 0, 0, 0);
 const toDateKey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
+const isValidEmail = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 /* ── Confetti ────────────────────────────────────────────────────────────── */
 
@@ -301,6 +313,13 @@ const Reservation = () => {
   }, [selectedTerrain, selectedDuration]);
 
   const selectedParticipants = participantEmails.slice(0, Math.max(0, participantCount - 1));
+  const participantStatusLabel = (status?: ParticipantStatus) => {
+    if (status === "creator") return t("res.participantStatus.creator");
+    if (status === "pending_account") return t("res.participantStatus.pendingAccount");
+    if (status === "invited") return t("res.participantStatus.invited");
+    if (status === "cancelled") return t("status.cancelled");
+    return t("status.confirmed");
+  };
 
   /* ── Handlers ──────────────────────────────────────────────────────────── */
 
@@ -330,21 +349,16 @@ const Reservation = () => {
   const handleReview = async () => {
     if (!user) { toast.error("Please sign in to continue."); return; }
     if (!selectedTerrain || !selectedDate || !selectedTime) { toast.error("Please select a court, date and time."); return; }
-    const normalizedEmails = selectedParticipants.map((e) => e.trim().toLowerCase());
-    if (normalizedEmails.some((e) => !e)) { toast.error("Please fill in all participant emails."); return; }
-    if (normalizedEmails.some((e) => e === user.email.toLowerCase())) { toast.error("Your email is already included automatically."); return; }
-    if (new Set(normalizedEmails).size !== normalizedEmails.length) { toast.error("Duplicate email detected."); return; }
-    setSubmitting(true);
-    try {
-      const result = await api<{ participants: Participant[] }>("/api/participants/lookup", { method: "POST", authenticated: true, body: JSON.stringify({ emails: normalizedEmails, arenaId: selectedTerrain.arenaId }) });
-      if (result.participants.length !== normalizedEmails.length) { toast.error("All participants must have an active account."); return; }
-      setParticipantPreview([{ id: user.id, firstName: user.firstName, lastName: user.lastName, email: user.email }, ...result.participants]);
-      setStep(3);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to verify participants.");
-    } finally {
-      setSubmitting(false);
-    }
+    const normalizedEmails = selectedParticipants.map(normalizeEmail);
+    if (normalizedEmails.some((e) => !e)) { toast.error(t("res.error.fillParticipants")); return; }
+    if (normalizedEmails.some((e) => !isValidEmail(e))) { toast.error(t("res.error.invalidEmail")); return; }
+    if (normalizedEmails.some((e) => e === normalizeEmail(user.email))) { toast.error(t("res.error.creatorIncluded")); return; }
+    if (new Set(normalizedEmails).size !== normalizedEmails.length) { toast.error(t("res.error.duplicateEmail")); return; }
+    setParticipantPreview([
+      { id: user.id, userId: user.id, firstName: user.firstName, lastName: user.lastName, email: user.email, status: "confirmed", role: "creator" },
+      ...normalizedEmails.map((email, index) => ({ email, displayName: `${t("res.players.participant")} ${index + 2}`, status: "pending_account" as ParticipantStatus, role: "participant" as const })),
+    ]);
+    setStep(3);
   };
 
   const handleConfirm = async () => {
@@ -353,14 +367,14 @@ const Reservation = () => {
     try {
       const result = await api<{ reservation: ReservationResult }>("/api/reservations", {
         method: "POST", authenticated: true,
-        body: JSON.stringify({ courtId: selectedTerrain.id, reservationDate: toDateKey(selectedDate), startTime: selectedTime, endTime, participantEmails: selectedParticipants }),
+        body: JSON.stringify({ courtId: selectedTerrain.id, reservationDate: toDateKey(selectedDate), startTime: selectedTime, endTime, participantEmails: selectedParticipants.map(normalizeEmail) }),
       });
       setConfirmedReservation(result.reservation);
       setPaymentStatus("idle");
       setStep(4);
       setShowConfetti(true);
       setTimeout(() => setShowConfetti(false), 100);
-      toast.success("Reservation confirmed!");
+      toast.success(t("res.success.title"));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unable to create reservation.");
     } finally {
@@ -587,7 +601,7 @@ const Reservation = () => {
 
         {/* ── Step 2: Players ── */}
         {step === 2 && selectedTerrain && (
-          <div className="max-w-lg animate-fade-in">
+          <div className="max-w-3xl mx-auto animate-fade-in">
             <div className="flex items-center justify-between gap-4 mb-6">
               <div>
                 <h2 className="font-display text-xl font-bold">{selectedTerrain.name}</h2>
@@ -596,7 +610,7 @@ const Reservation = () => {
               <Button variant="ghost" size="sm" className="gap-1 shrink-0" onClick={() => setStep(1)}><ChevronLeft size={15} /> {t("res.players.back")}</Button>
             </div>
 
-            <div className="gradient-card rounded-xl border border-border p-6 space-y-5">
+            <div className="gradient-card rounded-xl border border-border p-6 space-y-6">
               <div>
                 <label className="flex items-center gap-2 text-sm font-medium mb-2"><Users size={16} className="text-primary" />{t("res.players.numPlayers")}</label>
                 <select value={participantCount} onChange={(e) => setParticipantCount(Number(e.target.value))} className="w-full rounded-lg border border-border bg-card px-4 py-2.5 text-foreground">
@@ -604,17 +618,23 @@ const Reservation = () => {
                     <option key={n} value={n}>{n} {n !== 1 ? t("res.players.players") : t("res.players.player")}</option>
                   ))}
                 </select>
+                <p className="text-xs text-muted-foreground mt-3 leading-relaxed">{t("res.players.helper")}</p>
               </div>
 
-              <div className="space-y-3">
-                <div>
+              <div className="space-y-4">
+                <div className="rounded-xl border border-border bg-background/40 p-4">
                   <p className="text-sm font-medium">{t("res.players.creator")}</p>
                   <p className="text-xs text-muted-foreground">{user?.email ?? "—"}</p>
+                </div>
+                <div>
+                  <p className="text-sm font-semibold">{t("res.players.invitedTitle")}</p>
+                  <p className="text-xs text-muted-foreground">{t("res.players.invitedSubtitle")}</p>
                 </div>
                 {selectedParticipants.map((email, idx) => (
                   <div key={idx}>
                     <label className="text-sm font-medium">{t("res.players.participant")} {idx + 2}</label>
-                    <Input type="email" value={email} onChange={(e) => { const next = [...participantEmails]; next[idx] = e.target.value; setParticipantEmails(next); }} placeholder="email@example.com" className="mt-1.5" />
+                    <Input type="email" value={email} onChange={(e) => { const next = [...participantEmails]; next[idx] = e.target.value; setParticipantEmails(next); }} placeholder={t("res.players.emailPlaceholder")} className="mt-1.5" />
+                    <p className="text-[11px] text-muted-foreground mt-1.5">{t("res.players.guestNote")}</p>
                   </div>
                 ))}
               </div>
@@ -652,11 +672,17 @@ const Reservation = () => {
                 <div className="space-y-2">
                   {participantPreview.map((p) => (
                     <div key={p.email} className="rounded-lg bg-muted/30 px-3 py-2">
-                      <div className="font-medium">{p.firstName} {p.lastName}</div>
-                      <div className="text-xs text-muted-foreground">{p.email}</div>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="font-medium">{p.displayName || [p.firstName, p.lastName].filter(Boolean).join(" ") || p.email}</div>
+                          <div className="text-xs text-muted-foreground">{p.email}</div>
+                        </div>
+                        <Badge variant={p.role === "creator" ? "secondary" : "outline"}>{p.role === "creator" ? t("res.players.creator") : participantStatusLabel(p.status)}</Badge>
+                      </div>
                     </div>
                   ))}
                 </div>
+                <p className="text-xs text-muted-foreground mt-3">{t("res.players.helper")}</p>
               </div>
             </div>
             <div className="flex gap-3 mt-8">
@@ -691,16 +717,16 @@ const Reservation = () => {
 
               <div className="w-48 h-48 mx-auto rounded-2xl flex flex-col items-center justify-center border border-amber-400/25 mb-5 gap-3 bg-amber-400/5 backdrop-blur-sm p-3"
                 style={{ boxShadow: "0 0 30px hsl(45 90% 55% / 0.10)" }}>
-                <QrCode className="text-amber-400/60" size={80} />
-                <span className="text-[11px] uppercase tracking-widest text-amber-400/70">Pay to unlock</span>
+                <CreditCard className="text-amber-400/60" size={70} />
+                <span className="text-[11px] uppercase tracking-widest text-amber-400/70">{t("res.success.payToUnlock")}</span>
               </div>
 
               <p className="text-sm text-muted-foreground mb-4">
-                Complete payment on the right to receive your PDF ticket and QR code.
+                {t("res.success.paymentHint")}
               </p>
 
               <Button variant="ghost" className="text-muted-foreground text-sm" onClick={resetFlow}>
-                Book another court
+                {t("res.success.new")}
               </Button>
             </div>
 
@@ -732,13 +758,13 @@ const Reservation = () => {
                 disabled={paymentStatus === "paying"}
               >
                 {paymentStatus === "paying" ? (
-                  <><Loader2 className="animate-spin mr-2" size={16} /> Redirecting…</>
+                  <><Loader2 className="animate-spin mr-2" size={16} /> {t("res.billing.redirecting")}</>
                 ) : (
-                  <><CreditCard className="mr-2" size={16} /> Pay {totalPrice.toFixed(3)} TND via Stripe</>
+                  <><CreditCard className="mr-2" size={16} /> {t("res.billing.payStripe").replace("{amount}", totalPrice.toFixed(3))}</>
                 )}
               </Button>
               <p className="text-[11px] text-muted-foreground text-center">
-                You will be redirected to Stripe's secure payment page. Amount charged in EUR (≈ {(totalPrice * 0.30).toFixed(2)} EUR).
+                {t("res.billing.stripeHint").replace("{amount}", (totalPrice * 0.30).toFixed(2))}
               </p>
             </div>
           </div>

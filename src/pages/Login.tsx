@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -23,7 +23,10 @@ const Login = () => {
   const [forgotLoading, setForgotLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
   const { t } = useLocale();
+
+  const redirectTarget = new URLSearchParams(location.search).get("redirect");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,13 +40,11 @@ const Login = () => {
 
       setSession(result.token, result.user, result.refreshToken);
       toast.success("Login successful.");
-      navigate(
-        ["admin", "super_admin"].includes(result.user.role)
-          ? "/admin"
-          : result.user.role === "coach"
-            ? "/coach"
-            : "/reservation"
-      );
+      const defaultPath =
+        ["admin", "super_admin"].includes(result.user.role) ? "/admin" :
+        result.user.role === "coach" ? "/coach" :
+        "/reservation";
+      navigate(redirectTarget ?? defaultPath, { replace: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Login failed.");
     } finally {

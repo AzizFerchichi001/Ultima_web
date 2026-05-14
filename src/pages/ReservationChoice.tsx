@@ -17,7 +17,7 @@ const ReservationChoice = () => {
       notice: null,
       accent: "from-primary/10 to-primary/5",
       border: "border-primary/20 hover:border-primary/50",
-      onClick: () => navigate("/reservation/court"),
+      onClick: () => navigate("/player/reservations/new"),
     },
     {
       icon: <UserCheck className="w-8 h-8 text-amber-500" />,
@@ -27,7 +27,7 @@ const ReservationChoice = () => {
       notice: t("resChoice.withCoach.notice"),
       accent: "from-amber-500/10 to-amber-500/5",
       border: "border-amber-500/20 hover:border-amber-500/50",
-      onClick: () => navigate("/reservation/coach"),
+      onClick: () => navigate("/player/coach-booking"),
     },
   ];
 

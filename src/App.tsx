@@ -10,6 +10,11 @@ import Index from "./pages/Index";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import Reservation from "./pages/Reservation";
+import ReservationDetails from "./pages/ReservationDetails";
+import PlayerDashboard from "./pages/PlayerDashboard";
+import PlayerNotifications from "./pages/PlayerNotifications";
+import PlayerProfile from "./pages/PlayerProfile";
+import PlayerReservations from "./pages/PlayerReservations";
 import Competitions from "./pages/Competitions";
 import LiveScores from "./pages/LiveScores";
 import Performance from "./pages/Performance";
@@ -33,6 +38,15 @@ import CoachBooking from "./pages/CoachBooking";
 import PaymentSuccess from "./pages/PaymentSuccess";
 import PaymentCancel from "./pages/PaymentCancel";
 import LiveSessionPage from "./pages/LiveSessionPage";
+import SuperAdminCalibrationPage from "./pages/SuperAdminCalibrationPage";
+import AccountHome from "./pages/AccountHome";
+import AccountSettings from "./pages/AccountSettings";
+import AccountReservations from "./pages/AccountReservations";
+import AccountHistory from "./pages/AccountHistory";
+import AccountNotifications from "./pages/AccountNotifications";
+import AccountAiAnalysis from "./pages/AccountAiAnalysis";
+import AccountLiveSessions from "./pages/AccountLiveSessions";
+import AccountCompetitions from "./pages/AccountCompetitions";
 
 const queryClient = new QueryClient();
 
@@ -70,12 +84,41 @@ const App = () => (
               />
               <Route
                 path="/reservation/court"
-                element={<AuthGuard><Reservation /></AuthGuard>}
+                element={<Navigate to="/player/reservations/new" replace />}
+              />
+              <Route
+                path="/reservations/:id"
+                element={<AuthGuard><ReservationDetails /></AuthGuard>}
               />
               <Route
                 path="/reservation/coach"
-                element={<AuthGuard><CoachBooking /></AuthGuard>}
+                element={<Navigate to="/player/coach-booking" replace />}
               />
+
+              {/* Player workspace routes */}
+              <Route path="/player" element={<Navigate to="/account" replace />} />
+              <Route path="/player/reservations" element={<AuthGuard><PlayerReservations /></AuthGuard>} />
+              <Route path="/player/reservations/new" element={<AuthGuard><Reservation /></AuthGuard>} />
+              <Route path="/player/reservations/:id" element={<AuthGuard><ReservationDetails /></AuthGuard>} />
+              <Route path="/player/coach-booking" element={<AuthGuard><CoachBooking /></AuthGuard>} />
+              <Route path="/player/competitions" element={<Navigate to="/account/competitions" replace />} />
+              <Route path="/player/competitions/:id" element={<AuthGuard><CompetitionDetails /></AuthGuard>} />
+              <Route path="/player/live" element={<AuthGuard><LiveScores /></AuthGuard>} />
+              <Route path="/player/live/:id" element={<AuthGuard><LiveSessionPage /></AuthGuard>} />
+              <Route path="/player/ai" element={<Navigate to="/account/ai-analysis" replace />} />
+              <Route path="/player/history" element={<Navigate to="/account/history" replace />} />
+              <Route path="/player/notifications" element={<Navigate to="/account/notifications" replace />} />
+              <Route path="/player/profile" element={<Navigate to="/account/settings" replace />} />
+
+              {/* Account area routes */}
+              <Route path="/account" element={<AuthGuard><AccountHome /></AuthGuard>} />
+              <Route path="/account/settings" element={<AuthGuard><AccountSettings /></AuthGuard>} />
+              <Route path="/account/reservations" element={<AuthGuard><AccountReservations /></AuthGuard>} />
+              <Route path="/account/history" element={<AuthGuard><AccountHistory /></AuthGuard>} />
+              <Route path="/account/notifications" element={<AuthGuard><AccountNotifications /></AuthGuard>} />
+              <Route path="/account/ai-analysis" element={<AuthGuard><AccountAiAnalysis /></AuthGuard>} />
+              <Route path="/account/live-sessions" element={<AuthGuard><AccountLiveSessions /></AuthGuard>} />
+              <Route path="/account/competitions" element={<AuthGuard><AccountCompetitions /></AuthGuard>} />
               <Route 
                 path="/competitions" 
                 element={<AuthGuard><Competitions /></AuthGuard>} 
@@ -96,9 +139,9 @@ const App = () => (
                 path="/connections"
                 element={<AuthGuard><Connections /></AuthGuard>}
               />
-              <Route 
-                path="/smartplay-ai" 
-                element={<AuthGuard><SmartPlayAI /></AuthGuard>} 
+              <Route
+                path="/smartplay-ai"
+                element={<AuthGuard requireAdmin><SmartPlayAI /></AuthGuard>}
               />
               <Route
                 path="/live-sessions/:id"
@@ -134,12 +177,15 @@ const App = () => (
                 element={<AuthGuard><CoachingRequests /></AuthGuard>}
               />
 
-              {/* Admin section protected with role requirement */}
-              <Route 
-                path="/admin" 
-                element={<AuthGuard requireAdmin><Admin /></AuthGuard>} 
+              <Route
+                path="/admin"
+                element={<AuthGuard requireAdmin><Admin /></AuthGuard>}
               />
-              
+              <Route
+                path="/super-admin/calibration"
+                element={<AuthGuard requireAdmin><SuperAdminCalibrationPage /></AuthGuard>}
+              />
+
               {/* Stripe payment return pages — no auth guard needed (Stripe redirects here) */}
               <Route path="/payment/success" element={<PaymentSuccess />} />
               <Route path="/payment/cancel" element={<PaymentCancel />} />

@@ -14,8 +14,8 @@ const VerifyEmail = () => {
   const initialEmail = useMemo(() => String(searchParams.get("email") ?? "").trim().toLowerCase(), [searchParams]);
   const initialCode = useMemo(() => String(searchParams.get("code") ?? "").trim(), [searchParams]);
   const initialDevLink = useMemo(() => String(searchParams.get("devLink") ?? "").trim(), [searchParams]);
-  const [state, setState] = useState<VerifyState>("loading");
-  const [message, setMessage] = useState(token ? "Verifying your email..." : "Enter the 6-digit code sent to your email.");
+  const [state, setState] = useState<VerifyState>(token ? "loading" : "error");
+  const [message, setMessage] = useState(token ? "Verifying your email…" : "Enter the 6-digit code sent to your email.");
   const [verifyEmail, setVerifyEmail] = useState(initialEmail);
   const [verifyCode, setVerifyCode] = useState(initialCode);
   const [verifyingCode, setVerifyingCode] = useState(false);
@@ -24,10 +24,7 @@ const VerifyEmail = () => {
 
   useEffect(() => {
     const run = async () => {
-      if (!token) {
-        setState("error");
-        return;
-      }
+      if (!token) return;
       try {
         const result = await api<{ success: boolean; message?: string }>("/api/auth/verify-email?token=" + encodeURIComponent(token));
         setState("success");

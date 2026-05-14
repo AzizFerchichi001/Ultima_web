@@ -13,6 +13,7 @@ export type LiveSession = {
   reservationId: number | null;
   status: string;
   mode: "mock" | "real" | string;
+  aiSessionId?: string | null;
   aiStatusMessage: string | null;
   fps: number | null;
   lastFrame: number | null;
@@ -36,14 +37,24 @@ export type LiveVisualUpdate = {
   status?: string;
   source?: string;
   players?: Array<{
-    trackId?: string;
+    trackId?: string | number;
     label?: string;
     team?: string;
     confidence?: number;
-    bbox?: { x: number; y: number; w: number; h: number };
+    // mock format: {x,y,w,h} normalised  |  FastAPI format: [x1,y1,x2,y2] pixels
+    bbox?: { x: number; y: number; w: number; h: number } | [number, number, number, number];
     poseStatus?: string;
+    world?: { x: number; y: number };   // FastAPI: world-metre position
+    image?: { x: number; y: number };   // FastAPI: pixel centre
+    poseKeypoints?: unknown;
   }>;
-  ball?: { x: number; y: number; confidence?: number };
+  // mock: {x,y}  |  FastAPI: {bbox,image,world,confidence}
+  ball?: {
+    x?: number; y?: number; confidence?: number;
+    world?: { x: number; y: number };
+    image?: { x: number; y: number };
+    bbox?: [number, number, number, number] | { x: number; y: number; w: number; h: number };
+  };
   minimap?: {
     players?: Array<{ id?: string; label?: string; team?: string; x: number; y: number }>;
     ball?: { x: number; y: number };

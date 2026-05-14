@@ -1,4 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
+import { useLocale } from "@/i18n/locale";
+import { SuperAdminCalibrationContent } from "./SuperAdminCalibrationPage";
 import Layout from "@/components/Layout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,12 +11,16 @@ import { getSessionUser } from "@/lib/session";
 import SmartPlayClipAnalysisPanel from "@/components/smartplay/SmartPlayClipAnalysisPanel";
 import CourtCalibrationPanel from "@/components/smartplay/CourtCalibrationPanel";
 import AdminCourtLivePanel from "@/components/smartplay/AdminCourtLivePanel";
+import ReservationsPanel from "@/components/admin/ReservationsPanel";
+import CourtSchedulePanel from "@/components/admin/CourtSchedulePanel";
+import CoachSchedulesPanel from "@/components/admin/CoachSchedulesPanel";
+import LiveSessionsPanel from "@/components/admin/LiveSessionsPanel";
 import {
   Users, MapPin, Trophy, Activity, BarChart3, Shield, Settings,
   CreditCard, CheckCircle2, Clock,
   RefreshCw, ChevronRight, AlertCircle, Zap, Brain, Wifi,
   Plus, Trash2, UserCheck, UserX, Search, Award,
-  CalendarDays, Layers,
+  CalendarDays, Layers, Crosshair, Video, CalendarCheck,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -60,6 +66,19 @@ type RevenueSummary = {
 
 type SmartPlayStatus = {
   connected: boolean; version?: string | null; message: string;
+};
+
+type AdminCompetition = {
+  id: number; name: string; sport: string; description?: string;
+  start_date: string; end_date?: string; registration_deadline?: string;
+  location: string; max_participants: number; participants: number;
+  status: "open" | "full" | "closed"; rules?: string | null; prizes?: string | null;
+  arena_name?: string;
+};
+
+type CompRegistration = {
+  id: number; userId: number; firstName: string; lastName: string;
+  email: string; status: string; rankingScore: number; registeredAt: string;
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,15 +143,18 @@ function StatCard({ icon: Icon, label, value, sub, accent }: {
 // ── Sidebar nav items ─────────────────────────────────────────────────────────
 
 const navItems = [
-  { id: "overview", label: "Overview", icon: BarChart3 },
-  { id: "users", label: "Users", icon: Users },
-  { id: "courts", label: "Courts", icon: MapPin },
-  { id: "reservations", label: "Reservations", icon: CalendarDays },
-  { id: "scoring", label: "Analysis", icon: Layers },
-  { id: "competitions", label: "Competitions", icon: Trophy },
-  { id: "revenue", label: "Revenue", icon: CreditCard },
-  { id: "logs", label: "Activity Logs", icon: Activity },
-  { id: "system", label: "System Status", icon: Settings },
+  { id: "overview",       label: "Overview",        icon: BarChart3     },
+  { id: "users",          label: "Users",            icon: Users         },
+  { id: "courts",         label: "Courts",           icon: MapPin        },
+  { id: "schedule",       label: "Court Schedule",   icon: CalendarCheck },
+  { id: "reservations",   label: "Reservations",     icon: CalendarDays  },
+  { id: "coach-schedules",label: "Coach Schedules",  icon: Award         },
+  { id: "lives",          label: "Live Sessions",    icon: Video         },
+  { id: "scoring",        label: "Analysis",         icon: Layers        },
+  { id: "competitions",   label: "Competitions",     icon: Trophy        },
+  { id: "revenue",        label: "Revenue",          icon: CreditCard    },
+  { id: "logs",           label: "Activity Logs",    icon: Activity      },
+  { id: "system",         label: "System Status",    icon: Settings      },
 ];
 
 // ── Main Component ─────────────────────────────────────────────────────────────
@@ -140,6 +162,7 @@ const navItems = [
 const Admin = () => {
   const user = getSessionUser();
   const isSuperAdmin = user?.role === "super_admin";
+  const { t } = useLocale();
 
   const [activeSection, setActiveSection] = useState("overview");
   const [overview, setOverview] = useState<AdminOverview | null>(null);
@@ -156,6 +179,18 @@ const Admin = () => {
   const [showUserForm, setShowUserForm] = useState(false);
   const [showCourtForm, setShowCourtForm] = useState(false);
 
+  // Competition management
+  const blankCompForm = { name: "", sport: "Padel", description: "", startDate: "", endDate: "", registrationDeadline: "", location: "", maxParticipants: "16", status: "open" as "open" | "full" | "closed", rules: "", prizes: "" };
+  const [competitions, setCompetitions] = useState<AdminCompetition[]>([]);
+  const [compLoading, setCompLoading] = useState(false);
+  const [compForm, setCompForm] = useState(blankCompForm);
+  const [editingCompId, setEditingCompId] = useState<number | null>(null);
+  const [showCompForm, setShowCompForm] = useState(false);
+  const [compSaving, setCompSaving] = useState(false);
+  const [viewingRegistrations, setViewingRegistrations] = useState<number | null>(null);
+  const [registrations, setRegistrations] = useState<CompRegistration[]>([]);
+  const [regsLoading, setRegsLoading] = useState(false);
+
   const loadOverview = useCallback(async () => {
     if (!user || !["admin", "super_admin"].includes(user.role)) { setLoading(false); return; }
     try {
@@ -163,7 +198,7 @@ const Admin = () => {
       setOverview(result);
       setForm((c) => ({ ...c, arenaId: c.arenaId || String(user.arenaId ?? result.arenas[0]?.id ?? "") }));
       setCourtForm((c) => ({ ...c, arenaId: c.arenaId || String(user.arenaId ?? result.arenas[0]?.id ?? "") }));
-    } catch { toast.error("Failed to load admin panel."); } finally { setLoading(false); }
+    } catch (err) { toast.error(err instanceof Error ? err.message : "Failed to load admin panel."); } finally { setLoading(false); }
   }, [user?.id]);
 
   useEffect(() => { void loadOverview(); }, [loadOverview]);
@@ -184,7 +219,90 @@ const Admin = () => {
         .then(setAiStatus)
         .catch(() => setAiStatus({ connected: false, message: "Unable to reach AI service." }));
     }
+    if (activeSection === "competitions") {
+      void loadCompetitions();
+    }
   }, [activeSection]);
+
+  const loadCompetitions = async () => {
+    setCompLoading(true);
+    try {
+      const r = await api<{ competitions: AdminCompetition[] }>("/api/admin/competitions", { authenticated: true });
+      setCompetitions(r.competitions);
+    } catch { toast.error("Failed to load competitions."); } finally { setCompLoading(false); }
+  };
+
+  const openCreateComp = () => {
+    setEditingCompId(null);
+    setCompForm(blankCompForm);
+    setShowCompForm(true);
+  };
+
+  const openEditComp = (c: AdminCompetition) => {
+    setEditingCompId(c.id);
+    setCompForm({
+      name: c.name, sport: c.sport, description: c.description ?? "",
+      startDate: c.start_date?.slice(0, 10) ?? "", endDate: c.end_date?.slice(0, 10) ?? "",
+      registrationDeadline: c.registration_deadline?.slice(0, 10) ?? "",
+      location: c.location, maxParticipants: String(c.max_participants),
+      status: c.status, rules: c.rules ?? "", prizes: c.prizes ?? "",
+    });
+    setShowCompForm(true);
+  };
+
+  const saveComp = async () => {
+    if (!compForm.name || !compForm.startDate || !compForm.location || !compForm.maxParticipants) {
+      toast.error(t("admin.comp.required"));
+      return;
+    }
+    setCompSaving(true);
+    try {
+      const body = {
+        name: compForm.name, sport: compForm.sport, description: compForm.description || undefined,
+        startDate: compForm.startDate, endDate: compForm.endDate || undefined,
+        registrationDeadline: compForm.registrationDeadline || undefined,
+        location: compForm.location, maxParticipants: Number(compForm.maxParticipants),
+        status: compForm.status, rules: compForm.rules || undefined, prizes: compForm.prizes || undefined,
+      };
+      if (editingCompId) {
+        await api(`/api/admin/competitions/${editingCompId}`, { method: "PUT", body: JSON.stringify(body), authenticated: true });
+        toast.success(t("admin.comp.updated"));
+      } else {
+        await api("/api/admin/competitions", { method: "POST", body: JSON.stringify(body), authenticated: true });
+        toast.success(t("admin.comp.created"));
+      }
+      setShowCompForm(false);
+      void loadCompetitions();
+    } catch (e) { toast.error(e instanceof Error ? e.message : t("admin.comp.error")); } finally { setCompSaving(false); }
+  };
+
+  const deleteComp = async (id: number) => {
+    if (!confirm("Supprimer cette compétition et toutes ses inscriptions ?")) return;
+    try {
+      await api(`/api/admin/competitions/${id}`, { method: "DELETE", authenticated: true });
+      toast.success("Compétition supprimée.");
+      void loadCompetitions();
+    } catch (e) { toast.error(e instanceof Error ? e.message : "Erreur."); }
+  };
+
+  const loadRegistrations = async (compId: number) => {
+    setViewingRegistrations(compId);
+    setRegsLoading(true);
+    try {
+      const r = await api<{ registrations: CompRegistration[] }>(`/api/admin/competitions/${compId}/registrations`, { authenticated: true });
+      setRegistrations(r.registrations);
+    } catch { toast.error("Impossible de charger les inscriptions."); } finally { setRegsLoading(false); }
+  };
+
+  const removeRegistration = async (compId: number, userId: number) => {
+    if (!confirm("Retirer ce joueur de la compétition ?")) return;
+    try {
+      await api(`/api/admin/competitions/${compId}/registrations/${userId}`, { method: "DELETE", authenticated: true });
+      toast.success("Joueur retiré.");
+      void loadRegistrations(compId);
+      void loadCompetitions();
+    } catch (e) { toast.error(e instanceof Error ? e.message : "Erreur."); }
+  };
 
   const updateUserStatus = async (userId: number, status: "active" | "inactive") => {
     setSaving(true);
@@ -311,19 +429,34 @@ const Admin = () => {
           </div>
           <nav className="space-y-1 flex-1">
             {navItems.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => setActiveSection(item.id)}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
-                  activeSection === item.id
-                    ? "bg-primary/10 text-primary border border-primary/20"
-                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-                }`}
-              >
-                <item.icon size={16} />
-                {item.label}
-                {activeSection === item.id && <ChevronRight size={14} className="ml-auto" />}
-              </button>
+              <div key={item.id}>
+                <button
+                  onClick={() => setActiveSection(item.id)}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
+                    activeSection === item.id
+                      ? "bg-primary/10 text-primary border border-primary/20"
+                      : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                  }`}
+                >
+                  <item.icon size={16} />
+                  {item.label}
+                  {activeSection === item.id && <ChevronRight size={14} className="ml-auto" />}
+                </button>
+                {item.id === "users" && isSuperAdmin && (
+                  <button
+                    onClick={() => setActiveSection("calibration")}
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
+                      activeSection === "calibration"
+                        ? "bg-primary/10 text-primary border border-primary/20"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    }`}
+                  >
+                    <Crosshair size={16} />
+                    {t("superAdmin.nav")}
+                    {activeSection === "calibration" && <ChevronRight size={14} className="ml-auto" />}
+                  </button>
+                )}
+              </div>
             ))}
           </nav>
         </aside>
@@ -656,74 +789,42 @@ const Admin = () => {
             </div>
           )}
 
+          {/* ── Court Schedule ── */}
+          {activeSection === "schedule" && (
+            <CourtSchedulePanel />
+          )}
+
           {/* ── Reservations ── */}
           {activeSection === "reservations" && (
-            <div className="space-y-6">
-              <h2 className="text-2xl font-display font-bold">Reservations</h2>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-xs font-bold uppercase tracking-widest text-muted-foreground border-b border-border/50">
-                      <th className="text-left py-3 pr-4">Player</th>
-                      <th className="text-left py-3 pr-4">Court</th>
-                      <th className="text-left py-3 pr-4">Date & Time</th>
-                      <th className="text-left py-3 pr-4">Status</th>
-                      <th className="text-left py-3 pr-4">Payment</th>
-                      <th className="text-left py-3">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {reservations.map((r) => (
-                      <tr key={r.id} className="border-b border-border/20 hover:bg-muted/20 transition-colors">
-                        <td className="py-3 pr-4">
-                          <p className="font-medium">{r.owner_name}</p>
-                          <p className="text-xs text-muted-foreground">{r.owner_email}</p>
-                        </td>
-                        <td className="py-3 pr-4">
-                          <p className="text-sm">{r.court_name}</p>
-                          <p className="text-xs text-muted-foreground">{r.arena_name}</p>
-                        </td>
-                        <td className="py-3 pr-4 text-xs">
-                          <p>{r.reservation_date}</p>
-                          <p className="text-muted-foreground">{r.start_time} – {r.end_time}</p>
-                        </td>
-                        <td className="py-3 pr-4"><SBadge label={r.status} /></td>
-                        <td className="py-3 pr-4"><SBadge label={r.payment_status ?? "pending"} /></td>
-                        <td className="py-3">
-                          <div className="flex gap-1.5">
-                            {r.status === "confirmed" && (
-                              <>
-                                <button
-                                  onClick={() => updateReservationStatus(r.id, "completed")}
-                                  className="text-[10px] font-bold px-2 py-1 rounded-lg bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-colors"
-                                  disabled={saving}
-                                >Done</button>
-                                <button
-                                  onClick={() => updateReservationStatus(r.id, "cancelled")}
-                                  className="text-[10px] font-bold px-2 py-1 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors"
-                                  disabled={saving}
-                                >Cancel</button>
-                              </>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                    {!reservations.length && (
-                      <tr><td colSpan={6} className="py-12 text-center text-muted-foreground">No reservations found</td></tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <ReservationsPanel />
+          )}
+
+          {/* ── Coach Schedules ── */}
+          {activeSection === "coach-schedules" && (
+            <CoachSchedulesPanel />
+          )}
+
+          {/* ── Live Sessions ── */}
+          {activeSection === "lives" && (
+            <LiveSessionsPanel courts={overview?.courts ?? []} />
           )}
 
           {/* ── Analysis ── */}
           {activeSection === "scoring" && (
             <div className="space-y-6">
-              <h2 className="text-2xl font-display font-bold flex items-center gap-3">
-                <Layers size={24} className="text-primary" /> Video Analysis
-              </h2>
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <h2 className="text-2xl font-display font-bold flex items-center gap-3">
+                  <Layers size={24} className="text-primary" /> Video Analysis
+                </h2>
+                {isSuperAdmin && (
+                  <a
+                    href="/super-admin/calibration"
+                    className="inline-flex items-center gap-2 rounded-xl border border-border/50 bg-muted/30 px-4 py-2 text-sm font-bold text-foreground hover:border-border hover:bg-muted/50 transition-colors"
+                  >
+                    <Crosshair size={14} /> Arenas & Calibration
+                  </a>
+                )}
+              </div>
               <AdminCourtLivePanel courts={overview?.courts ?? []} />
               <CourtCalibrationPanel />
               <SmartPlayClipAnalysisPanel users={overview?.users ?? []} />
@@ -748,25 +849,192 @@ const Admin = () => {
           {/* ── Competitions ── */}
           {activeSection === "competitions" && (
             <div className="space-y-6">
-              <h2 className="text-2xl font-display font-bold">Competitions</h2>
-              <p className="text-muted-foreground text-sm">Manage tournaments from the competitions page.</p>
-              <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                <div className="gradient-card rounded-2xl border border-primary/20 p-6 text-center">
-                  <Trophy size={32} className="text-primary mx-auto mb-3" />
-                  <p className="font-bold">{stats?.activeCompetitions ?? 0} Active</p>
-                  <p className="text-xs text-muted-foreground">Running competitions</p>
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="text-2xl font-display font-bold">Compétitions</h2>
+                  <p className="text-muted-foreground text-sm mt-0.5">Créez et gérez les tournois de votre arena.</p>
                 </div>
-                <div className="gradient-card rounded-2xl border border-border/50 p-6 text-center">
-                  <Users size={32} className="text-muted-foreground mx-auto mb-3" />
-                  <p className="font-bold">{stats?.totalRegistrations ?? 0}</p>
-                  <p className="text-xs text-muted-foreground">Total registrations</p>
-                </div>
-                <div className="gradient-card rounded-2xl border border-border/50 p-6 text-center">
-                  <Activity size={32} className="text-muted-foreground mx-auto mb-3" />
-                  <p className="font-bold">{stats?.matchesThisWeek ?? 0}</p>
-                  <p className="text-xs text-muted-foreground">Matches this week</p>
-                </div>
+                <Button onClick={openCreateComp} className="flex items-center gap-2">
+                  <Plus size={16} /> Nouvelle compétition
+                </Button>
               </div>
+
+              {/* Stats row */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                <StatCard icon={Trophy} label="Actives" value={competitions.filter((c) => c.status === "open").length} sub="Inscriptions ouvertes" />
+                <StatCard icon={Users} label="Inscrits total" value={competitions.reduce((s, c) => s + (c.participants ?? 0), 0)} />
+                <StatCard icon={Activity} label="Total tournois" value={competitions.length} />
+              </div>
+
+              {/* Form modal */}
+              {showCompForm && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+                  <div className="gradient-card rounded-2xl border border-border w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 shadow-2xl space-y-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="font-bold text-lg">{editingCompId ? "Modifier la compétition" : "Nouvelle compétition"}</h3>
+                      <button onClick={() => setShowCompForm(false)} className="text-muted-foreground hover:text-foreground text-xl leading-none">×</button>
+                    </div>
+                    <div className="grid sm:grid-cols-2 gap-4">
+                      <div className="sm:col-span-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Nom *</label>
+                        <Input placeholder="Open de Padel Été 2025" value={compForm.name} onChange={(e) => setCompForm((f) => ({ ...f, name: e.target.value }))} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Sport *</label>
+                        <select className="w-full h-10 rounded-md border border-input bg-background px-3 text-sm" value={compForm.sport} onChange={(e) => setCompForm((f) => ({ ...f, sport: e.target.value }))}>
+                          {["Padel", "Tennis", "Football", "Basketball", "Volleyball", "Badminton", "Squash"].map((s) => <option key={s}>{s}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Lieu *</label>
+                        <Input placeholder="Arena Tunis" value={compForm.location} onChange={(e) => setCompForm((f) => ({ ...f, location: e.target.value }))} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Date de début *</label>
+                        <Input type="date" value={compForm.startDate} onChange={(e) => setCompForm((f) => ({ ...f, startDate: e.target.value }))} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Date de fin</label>
+                        <Input type="date" value={compForm.endDate} onChange={(e) => setCompForm((f) => ({ ...f, endDate: e.target.value }))} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Clôture inscriptions</label>
+                        <Input type="date" value={compForm.registrationDeadline} onChange={(e) => setCompForm((f) => ({ ...f, registrationDeadline: e.target.value }))} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Max participants *</label>
+                        <Input type="number" min="2" max="256" value={compForm.maxParticipants} onChange={(e) => setCompForm((f) => ({ ...f, maxParticipants: e.target.value }))} />
+                      </div>
+                      {editingCompId && (
+                        <div>
+                          <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Statut</label>
+                          <select className="w-full h-10 rounded-md border border-input bg-background px-3 text-sm" value={compForm.status} onChange={(e) => setCompForm((f) => ({ ...f, status: e.target.value as "open" | "full" | "closed" }))}>
+                            <option value="open">Ouvert</option>
+                            <option value="full">Complet</option>
+                            <option value="closed">Fermé</option>
+                          </select>
+                        </div>
+                      )}
+                      <div className="sm:col-span-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Description</label>
+                        <textarea className="w-full min-h-[80px] rounded-md border border-input bg-background px-3 py-2 text-sm resize-y" placeholder="Description du tournoi..." value={compForm.description} onChange={(e) => setCompForm((f) => ({ ...f, description: e.target.value }))} />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Règlement</label>
+                        <textarea className="w-full min-h-[80px] rounded-md border border-input bg-background px-3 py-2 text-sm resize-y" placeholder="Matchs en 2 sets gagnants..." value={compForm.rules} onChange={(e) => setCompForm((f) => ({ ...f, rules: e.target.value }))} />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground block mb-1">Récompenses (séparées par |)</label>
+                        <Input placeholder="1er: Trophée + 500 TND | 2ème: 200 TND | 3ème: 100 TND" value={compForm.prizes} onChange={(e) => setCompForm((f) => ({ ...f, prizes: e.target.value }))} />
+                        <p className="text-[11px] text-muted-foreground mt-1">Exemple: 1er prix | 2ème prix | 3ème prix</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-3 pt-2">
+                      <Button className="flex-1" onClick={() => void saveComp()} disabled={compSaving}>
+                        {compSaving ? "Enregistrement..." : editingCompId ? "Mettre à jour" : "Créer la compétition"}
+                      </Button>
+                      <Button variant="outline" onClick={() => setShowCompForm(false)}>Annuler</Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Registrations drawer */}
+              {viewingRegistrations !== null && (
+                <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+                  <div className="gradient-card rounded-2xl border border-border w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl">
+                    <div className="flex items-center justify-between p-5 border-b border-border">
+                      <div>
+                        <h3 className="font-bold">Inscrits — {competitions.find((c) => c.id === viewingRegistrations)?.name}</h3>
+                        <p className="text-xs text-muted-foreground mt-0.5">{registrations.length} joueur{registrations.length !== 1 ? "s" : ""}</p>
+                      </div>
+                      <button onClick={() => setViewingRegistrations(null)} className="text-muted-foreground hover:text-foreground text-xl">×</button>
+                    </div>
+                    <div className="overflow-y-auto flex-1 p-4 space-y-2">
+                      {regsLoading ? (
+                        [0, 1, 2].map((i) => <Skeleton key={i} className="h-12 rounded-xl" />)
+                      ) : registrations.length === 0 ? (
+                        <div className="py-10 text-center text-muted-foreground text-sm">Aucun joueur inscrit.</div>
+                      ) : (
+                        registrations.map((r, i) => (
+                          <div key={r.id} className="flex items-center gap-3 px-4 py-3 rounded-xl border border-border hover:bg-muted/20 transition-colors">
+                            <span className="w-6 h-6 rounded-full bg-muted flex items-center justify-center text-xs font-bold text-muted-foreground shrink-0">{i + 1}</span>
+                            <div className="flex-1 min-w-0">
+                              <div className="font-semibold text-sm">{r.firstName} {r.lastName}</div>
+                              <div className="text-xs text-muted-foreground">{r.email} · {new Date(r.registeredAt).toLocaleDateString("fr-FR")}</div>
+                            </div>
+                            <span className="text-xs font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-md shrink-0">{r.rankingScore} pts</span>
+                            <button
+                              className="text-red-400 hover:text-red-300 text-xs font-bold shrink-0 px-2 py-1 rounded-lg hover:bg-red-500/10 transition-colors"
+                              onClick={() => void removeRegistration(viewingRegistrations, r.userId)}
+                            >
+                              Retirer
+                            </button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Competitions table */}
+              {compLoading ? (
+                <div className="space-y-3">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-20 rounded-2xl" />)}</div>
+              ) : competitions.length === 0 ? (
+                <div className="gradient-card rounded-2xl border border-border p-12 text-center">
+                  <Trophy size={40} className="text-muted-foreground mx-auto mb-4 opacity-30" />
+                  <p className="font-semibold mb-1">Aucune compétition</p>
+                  <p className="text-sm text-muted-foreground mb-4">Créez votre premier tournoi pour commencer.</p>
+                  <Button size="sm" onClick={openCreateComp}><Plus size={14} className="mr-1" /> Créer une compétition</Button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {competitions.map((c) => {
+                    const fill = Math.min(100, Math.round(((c.participants ?? 0) / c.max_participants) * 100));
+                    const sConfig = { open: "bg-emerald-500/15 text-emerald-400", full: "bg-amber-500/15 text-amber-400", closed: "bg-red-500/15 text-red-400" };
+                    return (
+                      <div key={c.id} className="gradient-card rounded-2xl border border-border p-5">
+                        <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="font-bold text-base">{c.name}</h3>
+                              <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${sConfig[c.status]}`}>
+                                {c.status === "open" ? "Ouvert" : c.status === "full" ? "Complet" : "Fermé"}
+                              </span>
+                              <span className="text-[10px] text-muted-foreground bg-muted px-2 py-0.5 rounded-full">{c.sport}</span>
+                            </div>
+                            <div className="flex flex-wrap gap-3 text-xs text-muted-foreground mt-1.5">
+                              <span>{new Date(c.start_date).toLocaleDateString("fr-FR")}</span>
+                              <span>·</span>
+                              <span>{c.location}</span>
+                              <span>·</span>
+                              <span>{c.participants ?? 0} / {c.max_participants} inscrits</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => void loadRegistrations(c.id)}>
+                              <Users size={13} className="mr-1" /> Inscrits
+                            </Button>
+                            <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => openEditComp(c)}>
+                              Modifier
+                            </Button>
+                            <Button size="sm" variant="outline" className="h-8 text-xs text-red-400 hover:text-red-300 border-red-500/30 hover:bg-red-500/10" onClick={() => void deleteComp(c.id)}>
+                              <Trash2 size={13} />
+                            </Button>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                            <div className={`h-full rounded-full ${fill >= 100 ? "bg-amber-500" : fill >= 75 ? "bg-orange-500" : "bg-primary"}`} style={{ width: `${fill}%` }} />
+                          </div>
+                          <span className="text-xs text-muted-foreground font-mono w-8 text-right">{fill}%</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -835,6 +1103,12 @@ const Admin = () => {
                 )}
               </div>
             </div>
+          )}
+
+          {/* ── System Status ── */}
+          {/* ── Arenas & Calibration (super-admin) ── */}
+          {activeSection === "calibration" && (
+            <SuperAdminCalibrationContent onBack={() => setActiveSection("overview")} />
           )}
 
           {/* ── System Status ── */}

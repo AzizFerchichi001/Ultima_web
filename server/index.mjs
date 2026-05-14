@@ -10,11 +10,22 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
-import { Server as SocketIOServer } from "socket.io";
+import { initRedis } from "./redis.mjs";
+import { setPool as setPermissionPool } from "./permissions/middleware.mjs";
+import { initSocketIO } from "./realtime/socket.mjs";
+import {
+  requireAuth as _requireAuth,
+  optionalAuth as _optionalAuth,
+  requireAdmin as _requireAdmin,
+  requireCoach as _requireCoach,
+} from "./permissions/middleware.mjs";
+import { invalidateRoleCache } from "./permissions/resolveRoles.mjs";
+import { emitScoresUpdate, emitLiveUpdate, emitLiveStatus, emitBookingUpdate, emitUserNotification } from "./realtime/channels.mjs";
 import {
   DB_CLIENT_REQUESTED,
   DB_CLIENT_SELECTED,
   cancelReservation,
+  updateReservationRefund,
   closePool,
   createAnalysis,
   createArena,
@@ -38,6 +49,11 @@ import {
   getCourtById,
   getLeaderboard,
   getCompetitionDetails,
+  createCompetition,
+  updateCompetition,
+  deleteCompetition,
+  listCompetitionRegistrations,
+  removeCompetitionRegistration,
   getReservationTicketDetails,
   getReservationTicketDetailsByQr,
   verifyReservationTicketSignature,
@@ -58,11 +74,13 @@ import {
   listAdminReservations,
   listMatches,
   listReservationsForUser,
+  getReservationForUser,
   lookupParticipantsForArena,
   registerForCompetition,
   requestCoachRelationship,
   respondCoachRelationship,
   sanitizeUser,
+  updateUserProfile,
   persistRefreshToken,
   consumeRefreshToken,
   revokeRefreshTokensForUser,
@@ -166,6 +184,7 @@ import {
   createCourtCamera,
   createLiveSession,
   createSystemLiveSessionForReservation,
+  deleteLiveSession,
   getActiveCourtCamera,
   getCourtLiveCalibration,
   getLatestLiveUpdate,
@@ -175,6 +194,7 @@ import {
   listLiveSessionsNeedingStop,
   listReservationLivePlayers,
   listReservationsNeedingLiveStart,
+  patchLiveSession,
   recordLiveUpdate,
   saveCourtLiveCalibration,
   updateLiveSessionStatus,
@@ -182,11 +202,7 @@ import {
 
 const app = express();
 const httpServer = createServer(app);
-const io = new SocketIOServer(httpServer, {
-  cors: {
-    origin: "*",
-  },
-});
+let io = null;
 
 const PORT = Number(process.env.PORT ?? 4001);
 const JWT_SECRET = process.env.JWT_SECRET ?? "ultima-demo-secret";
@@ -212,7 +228,8 @@ const LAN_IP = (() => {
   return "127.0.0.1";
 })();
 // Public base URL for QR codes — set PUBLIC_SERVER_URL in .env when using a tunnel (ngrok/cloudflared)
-const PUBLIC_SERVER_URL = String(process.env.PUBLIC_SERVER_URL ?? "").trim() || `http://${LAN_IP}:${PORT}`;
+const PUBLIC_APP_URL = String(process.env.PUBLIC_APP_URL ?? process.env.PUBLIC_SERVER_URL ?? "").trim().replace(/\/+$/, "");
+const PUBLIC_SERVER_URL = PUBLIC_APP_URL || `http://${LAN_IP}:${PORT}`;
 const SMARTPLAY_CALLBACK_BASE_URL = String(process.env.SMARTPLAY_CALLBACK_BASE_URL ?? process.env.API_URL ?? PUBLIC_SERVER_URL).trim().replace(/\/+$/, "");
 httpServer.requestTimeout = LONG_UPLOAD_REQUEST_TIMEOUT_MS;
 httpServer.timeout = LONG_UPLOAD_REQUEST_TIMEOUT_MS;
@@ -241,6 +258,69 @@ const TND_TO_EUR_RATE = 0.30;
 const uploadsDir = path.resolve(process.cwd(), "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
 const liveMockTimers = new Map();
+const fileDemoProcesses = new Map(); // sessionId → ChildProcess
+let _fastApiProcess = null;
+
+async function tryStartFastApiService() {
+  if (!SMARTPLAY_AI_URL) return false;
+  // Check already running
+  try {
+    const r = await fetch(`${SMARTPLAY_AI_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (r.ok) { console.log("[smartplay-ai] FastAPI already running."); return true; }
+  } catch {}
+
+  const pythonExec = process.env.PYTHON_EXECUTABLE;
+  if (!pythonExec || !fs.existsSync(pythonExec)) {
+    console.warn("[smartplay-ai] PYTHON_EXECUTABLE not set or not found — cannot auto-start FastAPI.");
+    return false;
+  }
+  const scriptPath = process.env.SMARTPLAY_PIPELINE_SCRIPT;
+  if (!scriptPath) { console.warn("[smartplay-ai] SMARTPLAY_PIPELINE_SCRIPT not set — cannot locate smartplay root."); return false; }
+  const smartplayRoot = path.resolve(path.dirname(scriptPath), "..", "..");
+  const aiEnvPath = path.join(smartplayRoot, ".env");
+
+  // Parse smartplay_ai/.env so FastAPI gets its own config
+  const extraEnv = {};
+  if (fs.existsSync(aiEnvPath)) {
+    for (const line of fs.readFileSync(aiEnvPath, "utf-8").split(/\r?\n/)) {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)/);
+      if (m) extraEnv[m[1]] = m[2].replace(/^['"]|['"]$/g, "").trim();
+    }
+  }
+
+  console.log(`[smartplay-ai] Starting FastAPI service (cwd: ${smartplayRoot})…`);
+  const child = spawn(pythonExec, ["-m", "uvicorn", "ai_service.main:app", "--host", "127.0.0.1", "--port", "8000"], {
+    cwd: smartplayRoot,
+    detached: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...extraEnv, PYTHONPATH: smartplayRoot },
+  });
+  _fastApiProcess = child;
+  child.stdout?.on("data", (d) => {
+    const t = d.toString().trimEnd();
+    if (t) console.log(`[smartplay-ai] ${t}`);
+  });
+  child.stderr?.on("data", (d) => {
+    const t = d.toString().trimEnd();
+    if (t) console.error(`[smartplay-ai] ${t}`);
+  });
+  child.on("exit", (code) => {
+    console.log(`[smartplay-ai] FastAPI process exited (code ${code})`);
+    _fastApiProcess = null;
+  });
+
+  // Poll until ready (up to 90s — model loading takes time)
+  for (let i = 0; i < 90; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const r = await fetch(`${SMARTPLAY_AI_URL}/health`, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) { console.log(`[smartplay-ai] FastAPI ready after ${i + 1}s.`); return true; }
+    } catch {}
+  }
+  console.warn("[smartplay-ai] FastAPI did not become ready within 90 seconds.");
+  return false;
+}
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -291,6 +371,49 @@ function isLocalRequest(req) {
 }
 
 await initializeDatabase();
+
+// Wire Redis, permission pool, and Socket.IO after DB is ready
+{
+  const { default: pgPool } = await import("./pg-pool.mjs");
+  setPermissionPool(pgPool);        // inject pool into permission middleware
+  initRedis();                       // connect Redis (no-op if REDIS_URL not set)
+  io = initSocketIO(httpServer, pgPool);
+
+  // Auto-migrate: arena extra fields (idempotent — safe to run on every start)
+  await pgPool.query(`
+    ALTER TABLE arenas
+      ADD COLUMN IF NOT EXISTS image_url   TEXT,
+      ADD COLUMN IF NOT EXISTS description TEXT,
+      ADD COLUMN IF NOT EXISTS phone       VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS website     TEXT,
+      ADD COLUMN IF NOT EXISTS soft_deleted BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS deleted_at   TIMESTAMPTZ
+  `).then(() => console.log("[migration] arenas extra fields: ok"))
+    .catch(err => console.warn("[migration] arenas extra fields:", err.message));
+
+  // Auto-migrate: courts soft-delete columns
+  await pgPool.query(`
+    ALTER TABLE courts
+      ADD COLUMN IF NOT EXISTS soft_deleted BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS deleted_at   TIMESTAMPTZ
+  `).then(() => console.log("[migration] courts soft-delete: ok"))
+    .catch(err => console.warn("[migration] courts soft-delete:", err.message));
+
+  // Auto-migrate: court_blocks table (admin-managed unavailability blocks)
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS court_blocks (
+      id          SERIAL PRIMARY KEY,
+      court_id    INTEGER NOT NULL REFERENCES courts(id) ON DELETE CASCADE,
+      block_date  DATE    NOT NULL,
+      start_time  TIME    NOT NULL,
+      end_time    TIME    NOT NULL,
+      reason      TEXT,
+      created_by  INTEGER REFERENCES users(id),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `).then(() => console.log("[migration] court_blocks: ok"))
+    .catch(err => console.warn("[migration] court_blocks:", err.message));
+}
 
 async function ensureTestAccount({
   firstName,
@@ -435,11 +558,7 @@ function parseReservationDateTime(reservationDate, time) {
 function createToken(user) {
   const sanitized = sanitizeUser(user);
   return jwt.sign(
-    {
-      sub: sanitized.id,
-      role: sanitized.role,
-      email: sanitized.email,
-    },
+    { sub: sanitized.id, email: sanitized.email },  // role removed from JWT payload
     JWT_SECRET,
     { expiresIn: "8h" }
   );
@@ -453,61 +572,17 @@ async function issueSession(user) {
   return { token, refreshToken, user: sanitizeUser(user) };
 }
 
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "Authentication required" });
-  }
-
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET);
-    req.user = payload;
-    return next();
-  } catch {
-    return res.status(401).json({ message: "Invalid token" });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  if (!["admin", "super_admin"].includes(req.user?.role)) {
-    return res.status(403).json({ message: "Admin access required" });
-  }
-
-  return next();
-}
-
-function requireCoach(req, res, next) {
-  if (!["coach", "admin", "super_admin"].includes(req.user?.role)) {
-    return res.status(403).json({ message: "Coach access required" });
-  }
-
-  return next();
-}
+const requireAuth  = _requireAuth;
+const requireAdmin = _requireAdmin;
+const requireCoach = _requireCoach;
 
 async function attachActor(req) {
-  if (!req.user?.email) {
-    return null;
-  }
-
-  return findUserByEmail(req.user.email);
+  const userId = req.userId ?? req.user?.id ?? Number(req.user?.sub);
+  if (!userId) return null;
+  return getUserById(userId);
 }
 
-function optionalAuth(req, _res, next) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
-    req.user = null;
-    return next();
-  }
-
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET);
-    req.user = payload;
-  } catch {
-    req.user = null;
-  }
-
-  return next();
-}
+const optionalAuth = _optionalAuth;
 
 function requireAuthUnlessLocal(req, res, next) {
   if (isLocalRequest(req)) {
@@ -662,7 +737,7 @@ function startMockLiveSession(sessionId) {
       },
       pose: { status: "tracking", trackedPlayers: players.length },
     };
-    io.to(liveRoom(sessionId)).emit("live:update", payload);
+    if (io) emitLiveUpdate(io, sessionId, payload);
     if (frame % 30 === 0) {
       void recordLiveUpdate({ sessionId, payload }).catch((error) => {
         console.error("[live-mock] failed to persist update:", error);
@@ -694,21 +769,31 @@ async function startRealLiveSession(session) {
     throw error;
   }
   let resolvedSession = session;
+  const isFileDemoMode = ["file_demo", "local_demo"].includes(String(resolvedSession.mode ?? "").toLowerCase());
+
   if (!resolvedSession.cameraId || !resolvedSession.cameraUrl) {
     const activeCamera = await getActiveCourtCamera(resolvedSession.courtId);
-    if (!activeCamera) {
+    if (activeCamera) {
+      const { default: pgPool } = await import("./pg-pool.mjs");
+      await pgPool.query("UPDATE live_sessions SET camera_id = $1, updated_at = NOW() WHERE id = $2", [activeCamera.id, resolvedSession.id]);
+      resolvedSession = await getLiveSessionById(resolvedSession.id);
+    } else if (isFileDemoMode && process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE) {
+      // file_demo fallback: use env-var video source when no camera is configured for this court
+      resolvedSession = { ...resolvedSession, cameraUrl: process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE };
+    } else {
       const error = new Error("No active live camera is configured for this court. Configure a court camera before starting live analysis.");
       error.statusCode = 400;
       throw error;
     }
-    const { default: pgPool } = await import("./pg-pool.mjs");
-    await pgPool.query("UPDATE live_sessions SET camera_id = $1, updated_at = NOW() WHERE id = $2", [activeCamera.id, resolvedSession.id]);
-    resolvedSession = await getLiveSessionById(resolvedSession.id);
   }
   if (!resolvedSession.cameraUrl) {
-    const error = new Error("No camera source configured for this live session.");
-    error.statusCode = 400;
-    throw error;
+    if (isFileDemoMode && process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE) {
+      resolvedSession = { ...resolvedSession, cameraUrl: process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE };
+    } else {
+      const error = new Error("No camera source configured for this live session.");
+      error.statusCode = 400;
+      throw error;
+    }
   }
 
   await updateLiveSessionStatus({
@@ -717,15 +802,20 @@ async function startRealLiveSession(session) {
     message: "Starting SmartPlay AI live visual analysis.",
   });
 
-  const calibration = await getCourtLiveCalibration(resolvedSession.courtId, resolvedSession.cameraId);
+  let calibration = await getCourtLiveCalibration(resolvedSession.courtId, resolvedSession.cameraId);
   if (!calibration?.isValidForLive) {
-    const error = new Error(
-      calibration?.homography_json_path
-        ? "Court calibration is not valid for live analysis. Re-annotate or mark the calibration valid."
-        : "Court live calibration is missing. Annotate the court first so live analysis can reuse its homography."
-    );
-    error.statusCode = 400;
-    throw error;
+    // file_demo fallback: use env-var homography when no DB calibration exists
+    if (isFileDemoMode && process.env.SMARTPLAY_HOMOGRAPHY_JSON) {
+      calibration = { isValidForLive: true, homography_json_path: process.env.SMARTPLAY_HOMOGRAPHY_JSON, sport: "padel" };
+    } else {
+      const error = new Error(
+        calibration?.homography_json_path
+          ? "Court calibration is not valid for live analysis. Re-annotate or mark the calibration valid."
+          : "Court live calibration is missing. Annotate the court first so live analysis can reuse its homography."
+      );
+      error.statusCode = 400;
+      throw error;
+    }
   }
   const callbackBaseUrl = `${SMARTPLAY_CALLBACK_BASE_URL}/api/smartplay/live/${resolvedSession.id}`;
   const homographyJsonPath = calibration?.homography_json_path
@@ -791,10 +881,11 @@ async function startRealLiveSession(session) {
     message: body?.message ?? "SmartPlay AI live visual analysis running.",
     aiSessionId,
   });
-  io.to(liveRoom(resolvedSession.id)).emit("live:status", {
+  if (io) emitLiveStatus(io, resolvedSession.id, {
     sessionId: resolvedSession.id,
     status: "running",
     message: "SmartPlay AI live visual analysis running.",
+    aiSessionId,
   });
   const updatedSession = await getLiveSessionById(resolvedSession.id);
   return {
@@ -807,9 +898,140 @@ async function startRealLiveSession(session) {
   };
 }
 
+function stopFileDemoProcess(sessionId) {
+  const child = fileDemoProcesses.get(Number(sessionId));
+  if (child) {
+    try { child.kill("SIGTERM"); } catch { /* already dead */ }
+    fileDemoProcesses.delete(Number(sessionId));
+  }
+}
+
+function startFileDemoProcess(sessionId) {
+  const pythonExec = process.env.PYTHON_EXECUTABLE || "python";
+  const scriptPath = process.env.SMARTPLAY_PIPELINE_SCRIPT;
+  if (!scriptPath) throw Object.assign(new Error("SMARTPLAY_PIPELINE_SCRIPT is not set in .env"), { statusCode: 500 });
+  if (!fs.existsSync(scriptPath)) throw Object.assign(new Error(`Pipeline script not found: ${scriptPath}`), { statusCode: 500 });
+
+  const source = process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE;
+  if (!source) throw Object.assign(new Error("SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE is not set in .env"), { statusCode: 500 });
+  if (!fs.existsSync(source)) throw Object.assign(new Error(`Source video not found: ${source}`), { statusCode: 400 });
+
+  const homographyJson = process.env.SMARTPLAY_HOMOGRAPHY_JSON;
+  if (!homographyJson) throw Object.assign(new Error("SMARTPLAY_HOMOGRAPHY_JSON is not set in .env"), { statusCode: 500 });
+  if (!fs.existsSync(homographyJson)) throw Object.assign(new Error(`Homography JSON not found: ${homographyJson}`), { statusCode: 400 });
+
+  const playerModel = process.env.SMARTPLAY_PLAYER_MODEL;
+  if (!playerModel) throw Object.assign(new Error("SMARTPLAY_PLAYER_MODEL is not set in .env"), { statusCode: 500 });
+  if (!fs.existsSync(playerModel)) throw Object.assign(new Error(`Player model not found: ${playerModel}`), { statusCode: 400 });
+
+  const ballModel = process.env.SMARTPLAY_BALL_MODEL;
+  if (!ballModel) throw Object.assign(new Error("SMARTPLAY_BALL_MODEL is not set in .env"), { statusCode: 500 });
+  if (!fs.existsSync(ballModel)) throw Object.assign(new Error(`Ball model not found: ${ballModel}`), { statusCode: 400 });
+
+  const poseModel = process.env.SMARTPLAY_POSE_MODEL || null;
+  const apiUrl = process.env.API_URL || "http://localhost:4001";
+  const callbackSecret = process.env.SMARTPLAY_CALLBACK_SECRET || "";
+
+  // Speed settings: SMARTPLAY_LIVE_* takes priority over SMARTPLAY_* for subprocess mode
+  const e = process.env;
+  const imgsz_player  = e.SMARTPLAY_LIVE_IMGSZ_PLAYER  || e.SMARTPLAY_IMGSZ_PLAYER  || "640";
+  const imgsz_ball    = e.SMARTPLAY_LIVE_IMGSZ_BALL    || e.SMARTPLAY_IMGSZ_BALL    || "640";
+  const imgsz_pose    = e.SMARTPLAY_LIVE_IMGSZ_POSE    || e.SMARTPLAY_IMGSZ_POSE    || "384";
+  const detectEvery   = e.SMARTPLAY_LIVE_DETECT_EVERY  || e.SMARTPLAY_DETECT_EVERY  || "3";
+  const poseEvery     = e.SMARTPLAY_LIVE_POSE_EVERY    || e.SMARTPLAY_POSE_EVERY    || "15";
+  const callbackEvery = e.SMARTPLAY_LIVE_CALLBACK_EVERY || e.SMARTPLAY_CALLBACK_EVERY || "3";
+  const device        = e.SMARTPLAY_LIVE_DEVICE        || "0";
+  const useHalf       = (e.SMARTPLAY_LIVE_HALF         || "1") === "1";
+  const disablePose   = (e.SMARTPLAY_LIVE_DISABLE_POSE || "0") === "1";
+  const maxPoseAge    = e.SMARTPLAY_LIVE_MAX_POSE_AGE  || "10";
+  const drawStalePose = (e.SMARTPLAY_LIVE_DRAW_STALE_POSE || "0") === "1";
+  const ballIgnoreZones  = e.SMARTPLAY_LIVE_BALL_IGNORE_ZONES || "";
+  const ignoreRescueConf = e.SMARTPLAY_LIVE_IGNORE_RESCUE_CONF || "0.40";
+
+  const smartplayRoot = path.resolve(path.dirname(scriptPath), "..", "..");
+
+  const args = [
+    scriptPath,
+    "--source", source,
+    "--homography_json", homographyJson,
+    "--player_model", playerModel,
+    "--ball_model", ballModel,
+    "--no_display",
+    "--realtime",
+    "--device", device,
+    "--detect_every", detectEvery,
+    "--pose_every", poseEvery,
+    "--imgsz_player", imgsz_player,
+    "--imgsz_ball", imgsz_ball,
+    "--imgsz_pose", imgsz_pose,
+    "--api_url", apiUrl,
+    "--session_id", String(sessionId),
+    "--callback_secret", callbackSecret,
+    "--callback_every", callbackEvery,
+  ];
+  if (useHalf) args.push("--half");
+  if (poseModel && fs.existsSync(poseModel) && !disablePose) args.push("--pose_model", poseModel);
+  args.push("--max_pose_age", maxPoseAge);
+  if (drawStalePose) args.push("--draw_stale_pose");
+  if (ballIgnoreZones && fs.existsSync(ballIgnoreZones)) {
+    args.push("--ball_ignore_zones_json", ballIgnoreZones);
+    args.push("--ignore_rescue_conf", ignoreRescueConf);
+  } else if (ballIgnoreZones) {
+    console.warn(`[file_demo:${sessionId}] SMARTPLAY_LIVE_BALL_IGNORE_ZONES set but file not found: ${ballIgnoreZones}`);
+  }
+
+  console.log(`[file_demo:${sessionId}] spawning: ${pythonExec} ${args[0]}`);
+  console.log(`[file_demo:${sessionId}]   source=${source}`);
+  console.log(`[file_demo:${sessionId}]   player_model=${playerModel}`);
+  console.log(`[file_demo:${sessionId}]   ball_model=${ballModel}`);
+  console.log(`[file_demo:${sessionId}]   homography=${homographyJson}`);
+  console.log(`[file_demo:${sessionId}]   speed: imgsz_player=${imgsz_player} imgsz_ball=${imgsz_ball} imgsz_pose=${imgsz_pose}`);
+  console.log(`[file_demo:${sessionId}]   speed: detect_every=${detectEvery} pose_every=${poseEvery} callback_every=${callbackEvery}`);
+  console.log(`[file_demo:${sessionId}]   speed: device=${device} half=${useHalf} disable_pose=${disablePose}`);
+  console.log(`[file_demo:${sessionId}]   ball_ignore_zones=${ballIgnoreZones || "(none)"} rescue_conf=${ignoreRescueConf}`);
+
+  // Kill any existing process for this session
+  stopFileDemoProcess(sessionId);
+
+  const child = spawn(pythonExec, args, {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+    cwd: smartplayRoot,
+    env: { ...process.env, PYTHONPATH: smartplayRoot },
+  });
+
+  fileDemoProcesses.set(Number(sessionId), child);
+
+  child.stdout.on("data", (d) => {
+    const text = d.toString().trimEnd();
+    if (text) console.log(`[file_demo:${sessionId}]`, text);
+  });
+  child.stderr.on("data", (d) => {
+    const text = d.toString().trimEnd();
+    if (text) console.error(`[file_demo:${sessionId}]`, text);
+  });
+  child.on("exit", async (code) => {
+    fileDemoProcesses.delete(Number(sessionId));
+    const status = code === 0 || code === null ? "stopped" : "error";
+    const msg = code === 0 || code === null
+      ? "File demo pipeline finished."
+      : `Pipeline exited with code ${code}.`;
+    await updateLiveSessionStatus({ sessionId: Number(sessionId), status, message: msg, stopped: status === "stopped" }).catch(() => {});
+    if (io) io.to(liveRoom(Number(sessionId))).emit("live:stopped", { sessionId: Number(sessionId), status });
+  });
+
+  return child;
+}
+
 async function stopLiveSession(session, message = "Live analysis stopped.") {
   stopMockLiveSession(session.id);
-  if (session.mode === "real" && SMARTPLAY_AI_URL && session.aiSessionId) {
+  stopFileDemoProcess(session.id);
+  // Call FastAPI stop for any session whose aiSessionId was issued by FastAPI (live- prefix).
+  const fastapiPrefixes = ["filedemo-", "mock-", "local-"];
+  const hasFastapiSession = SMARTPLAY_AI_URL && session.aiSessionId &&
+    !fastapiPrefixes.some((p) => String(session.aiSessionId).startsWith(p));
+  if (hasFastapiSession) {
     await callSmartPlayJson("/live/stop", {
       method: "POST",
       headers: {
@@ -820,7 +1042,7 @@ async function stopLiveSession(session, message = "Live analysis stopped.") {
     }).catch((error) => console.warn("[live] SmartPlay stop failed:", error));
   }
   await updateLiveSessionStatus({ sessionId: session.id, status: "stopped", message, stopped: true });
-  io.to(liveRoom(session.id)).emit("live:stopped", { sessionId: session.id, status: "stopped" });
+  if (io) io.to(liveRoom(session.id)).emit("live:stopped", { sessionId: session.id, status: "stopped" });
   return getLiveSessionById(session.id);
 }
 
@@ -1006,9 +1228,6 @@ app.post("/api/auth/signup", async (req, res) => {
     if (!nom || !prenom) {
       return res.status(400).json({ message: "First name and last name are required" });
     }
-    if (!CIN_REGEX.test(String(cinNumber ?? "").trim())) {
-      return res.status(400).json({ message: "CIN is required and must contain exactly 8 digits" });
-    }
 
     if (await findUserByEmail(normalizedEmail)) {
       return res.status(409).json({ message: "Email already in use" });
@@ -1021,47 +1240,10 @@ app.post("/api/auth/signup", async (req, res) => {
       email: normalizedEmail,
       passwordHash,
       membershipRole: "player",
-      cinNumber: String(cinNumber).trim(),
     });
 
-    const verification = await requestEmailVerification(normalizedEmail);
-    const verifyLink = verification.token
-      ? `${getPublicWebBaseUrl(req)}/verify-email?token=${encodeURIComponent(verification.token)}`
-      : null;
-    const verifyCode = verification.code ? String(verification.code) : null;
-    let emailSent = false;
-    if (verification.user?.email && (verifyCode || verifyLink)) {
-      try {
-        if (verifyCode) {
-          await sendVerificationCodeEmail({
-            to: verification.user.email,
-            firstName: verification.user.firstName,
-            code: verifyCode,
-            verifyLink,
-          });
-        }
-        if (verifyLink) {
-          await sendVerificationEmail({
-            to: verification.user.email,
-            firstName: verification.user.firstName,
-            verifyLink,
-          });
-        }
-        emailSent = true;
-      } catch (error) {
-        console.warn("[auth/signup] verification email send failed:", error?.message ?? error);
-      }
-    }
-    return res.status(201).json({
-      success: true,
-      requiresEmailVerification: true,
-      message: isMailerConfigured() && emailSent
-        ? "Account created. Check your email for the verification code."
-        : "Account created, but email delivery failed. Use resend verification or dev fallback.",
-      email: normalizedEmail,
-      verificationCode: isLocalRequest(req) ? verifyCode : undefined,
-      verificationLink: isLocalRequest(req) ? verifyLink : undefined,
-    });
+    const newUser = await findUserByEmail(normalizedEmail);
+    return res.status(201).json(await issueSession(newUser));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to sign up";
     const lower = String(message).toLowerCase();
@@ -1093,9 +1275,6 @@ app.post("/api/auth/login", async (req, res) => {
   const isValid = await bcrypt.compare(password, user.password_hash);
   if (!isValid) {
     return res.status(401).json({ message: "Invalid credentials" });
-  }
-  if (!user.email_verified_at) {
-    return res.status(403).json({ message: "Please verify your email before logging in." });
   }
 
   return res.json(await issueSession(user));
@@ -1130,48 +1309,48 @@ app.post("/api/auth/logout", requireAuth, async (req, res) => {
   }
 });
 
+// Player: update own profile (name only — email not changeable)
+app.patch("/api/player/profile", requireAuth, async (req, res) => {
+  try {
+    const { firstName, lastName } = req.body ?? {};
+    const user = await updateUserProfile(req.user.sub, { firstName, lastName });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json(await issueSession(user));
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to update profile" });
+  }
+});
+
 app.post("/api/auth/forgot-password", async (req, res) => {
   const { email } = req.body ?? {};
   const normalizedEmail = String(email ?? "").trim().toLowerCase();
   if (!EMAIL_REGEX.test(normalizedEmail)) {
     return res.status(400).json({ message: "Valid email is required" });
   }
-  const result = await requestPasswordReset(normalizedEmail);
-  const resetLink = result.token
-    ? `${getPublicWebBaseUrl(req)}/reset-password?token=${encodeURIComponent(result.token)}`
-    : null;
-  const resetCode = result.code ? String(result.code) : null;
-  let emailSent = false;
-  if (result.user?.email && (resetCode || resetLink)) {
-    try {
-      if (resetCode) {
-        await sendPasswordResetCodeEmail({
-          to: result.user.email,
-          firstName: result.user.firstName,
-          code: resetCode,
-          resetLink,
-        });
-      }
-      if (resetLink) {
-        await sendPasswordResetEmail({
-          to: result.user.email,
-          firstName: result.user.firstName,
-          resetLink,
-        });
-      }
-      emailSent = true;
-    } catch (error) {
-      console.warn("[auth/forgot-password] reset email send failed:", error?.message ?? error);
+  try {
+    const result = await requestPasswordReset(normalizedEmail);
+    const resetCode = result.code ? String(result.code) : null;
+
+    if (!resetCode) {
+      return res.status(404).json({ error: "No account found with that email." });
     }
+
+    try {
+      await sendPasswordResetCodeEmail({ to: normalizedEmail, code: resetCode });
+      console.log("[auth/forgot-password] Email delivered to:", normalizedEmail);
+    } catch (mailError) {
+      console.error("[auth/forgot-password] SMTP ERROR:", mailError.message);
+      return res.status(500).json({
+        error: "Email delivery failed: " + mailError.message,
+        code: resetCode,
+      });
+    }
+
+    return res.json({ code: resetCode });
+  } catch (error) {
+    console.error("[auth/forgot-password] Failed:", error);
+    return res.status(500).json({ error: error.message });
   }
-  return res.json({
-    success: true,
-    message: isMailerConfigured() && emailSent
-      ? "If the account exists, a reset code has been sent by email."
-      : "If the account exists, a reset code is ready (email delivery failed or SMTP not configured).",
-    resetCode: isLocalRequest(req) ? resetCode : undefined,
-    resetLink: isLocalRequest(req) ? resetLink : undefined,
-  });
 });
 
 app.post("/api/auth/reset-password", async (req, res) => {
@@ -1244,23 +1423,14 @@ app.post("/api/auth/resend-verification", async (req, res) => {
     : null;
   const verifyCode = verification.code ? String(verification.code) : null;
   let emailSent = false;
-  if (verification.user?.email && (verifyCode || verifyLink)) {
+  if (verification.user?.email && verifyCode) {
     try {
-      if (verifyCode) {
-        await sendVerificationCodeEmail({
-          to: verification.user.email,
-          firstName: verification.user.firstName,
-          code: verifyCode,
-          verifyLink,
-        });
-      }
-      if (verifyLink) {
-        await sendVerificationEmail({
-          to: verification.user.email,
-          firstName: verification.user.firstName,
-          verifyLink,
-        });
-      }
+      await sendVerificationCodeEmail({
+        to: verification.user.email,
+        firstName: verification.user.firstName,
+        code: verifyCode,
+        verifyLink,
+      });
       emailSent = true;
     } catch (error) {
       console.warn("[auth/resend-verification] verification email send failed:", error?.message ?? error);
@@ -1375,13 +1545,148 @@ app.post("/api/reservations", requireAuth, async (req, res) => {
 });
 
 app.patch("/api/reservations/:id/cancel", requireAuth, async (req, res) => {
-  const actor = await attachActor(req);
-  const result = await cancelReservation(Number(req.params.id), actor);
-  if (!result.changes) {
-    return res.status(404).json({ message: "Reservation not found" });
-  }
+  try {
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "Authentication required" });
 
-  return res.json({ success: true });
+    const reservationId = Number(req.params.id);
+    const { reason } = req.body ?? {};
+
+    const result = await cancelReservation(reservationId, actor, reason ?? null);
+
+    if (!result.changes && !result.alreadyCancelled) {
+      return res.status(404).json({ message: "Reservation not found" });
+    }
+
+    const reservation = result.reservation;
+
+    // Already cancelled — return existing state without processing refund again
+    if (result.alreadyCancelled) {
+      return res.json({
+        success: true,
+        reservation: {
+          id: reservation.id,
+          status: reservation.status,
+          cancelled_at: reservation.cancelled_at ?? null,
+          cancelled_by_user_id: reservation.cancelled_by_user_id ?? null,
+          cancellation_reason: reservation.cancellation_reason ?? null,
+        },
+        refund: {
+          status: reservation.refund_status ?? "not_applicable",
+          stripeRefundId: reservation.stripe_refund_id ?? null,
+          amount: reservation.refunded_amount ?? null,
+        },
+        notifications: { coachNotified: false },
+        message: "Reservation was already cancelled",
+      });
+    }
+
+    // ── Stripe refund ──────────────────────────────────────────────────────────
+    let refundResult = { status: "not_applicable", stripeRefundId: null, amount: null };
+
+    if (STRIPE_SECRET_KEY && reservation.stripe_session_id && reservation.payment_status === "paid") {
+      try {
+        const { default: Stripe } = await import("stripe");
+        const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+        const session = await stripe.checkout.sessions.retrieve(reservation.stripe_session_id, {
+          expand: ["payment_intent"],
+        });
+        const paymentIntentId =
+          typeof session.payment_intent === "string"
+            ? session.payment_intent
+            : session.payment_intent?.id ?? null;
+
+        if (paymentIntentId) {
+          const refund = await stripe.refunds.create({ payment_intent: paymentIntentId });
+          refundResult = {
+            status: refund.status === "succeeded" ? "succeeded" : "pending",
+            stripeRefundId: refund.id,
+            amount: refund.amount / 100,
+          };
+          await updateReservationRefund(reservationId, {
+            refundStatus: refundResult.status,
+            stripeRefundId: refund.id,
+            refundedAmount: refundResult.amount,
+          });
+        } else {
+          await updateReservationRefund(reservationId, { refundStatus: "not_applicable" });
+        }
+      } catch (stripeError) {
+        console.error("[cancel/stripe refund]", stripeError.message);
+        const isAlreadyRefunded = stripeError.code === "charge_already_refunded";
+        refundResult = {
+          status: isAlreadyRefunded ? "already_refunded" : "failed",
+          stripeRefundId: null,
+          amount: null,
+          error: stripeError.message,
+        };
+        await updateReservationRefund(reservationId, {
+          refundStatus: refundResult.status,
+          refundError: stripeError.message,
+        });
+      }
+    } else {
+      await updateReservationRefund(reservationId, { refundStatus: "not_applicable" });
+    }
+
+    // ── Coach notification ─────────────────────────────────────────────────────
+    let coachNotified = false;
+    const coachUserId = result.cancelledSession?.coach_user_id ?? null;
+    if (coachUserId) {
+      try {
+        const playerName = `${actor.first_name} ${actor.last_name}`;
+        const resDate = String(reservation.reservation_date).slice(0, 10);
+        const resTime = String(reservation.start_time).slice(0, 5);
+        await createNotification({
+          userId: coachUserId,
+          title: "Reservation cancelled",
+          body: `${playerName} cancelled the session on ${resDate} at ${resTime} at ${reservation.arena_name}.`,
+          type: "reservation_cancelled",
+          linkUrl: "/coach",
+        });
+        coachNotified = true;
+      } catch (_) {}
+    }
+
+    // ── Player confirmation notification ───────────────────────────────────────
+    try {
+      const refundMsg =
+        refundResult.status === "succeeded" ? " A refund has been processed."
+        : refundResult.status === "pending" ? " A refund is pending."
+        : refundResult.status === "failed" ? " Refund failed — an admin will review."
+        : "";
+      await createNotification({
+        userId: reservation.user_id,
+        title: "Reservation cancelled",
+        body: `Your reservation on ${String(reservation.reservation_date).slice(0, 10)} at ${String(reservation.start_time).slice(0, 5)} has been cancelled.${refundMsg}`,
+        type: "reservation_cancelled",
+        linkUrl: "/performance?tab=reservations",
+      });
+    } catch (_) {}
+
+    if (io) emitBookingUpdate(io, reservation.arena_id, req.userId, "booking:cancelled", { reservationId });
+
+    return res.json({
+      success: true,
+      reservation: {
+        id: reservationId,
+        status: "cancelled",
+        cancelled_at: new Date().toISOString(),
+        cancelled_by_user_id: actor.id,
+        cancellation_reason: reason ?? null,
+      },
+      refund: {
+        status: refundResult.status,
+        stripeRefundId: refundResult.stripeRefundId ?? null,
+        amount: refundResult.amount ?? null,
+      },
+      notifications: { coachNotified },
+    });
+  } catch (error) {
+    console.error("[PATCH /api/reservations/:id/cancel]", error);
+    return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to cancel reservation" });
+  }
 });
 
 app.get("/api/competitions", optionalAuth, async (req, res) => {
@@ -1412,6 +1717,73 @@ app.post("/api/competitions/:id/register", requireAuth, async (req, res) => {
   return res.json({ success: true });
 });
 
+// ── Admin competition management ──────────────────────────────────────────────
+
+app.get("/api/admin/competitions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const competitions = await listCompetitions(actor);
+    res.json({ competitions });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Error" });
+  }
+});
+
+app.post("/api/admin/competitions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, rules, prizes } = req.body ?? {};
+    if (!name || !sport || !startDate || !location || !maxParticipants) {
+      return res.status(400).json({ message: "name, sport, startDate, location, maxParticipants are required" });
+    }
+    const competition = await createCompetition(actor, { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants: Number(maxParticipants), rules, prizes });
+    res.status(201).json({ competition });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Error creating competition" });
+  }
+});
+
+app.put("/api/admin/competitions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, status, rules, prizes } = req.body ?? {};
+    const competition = await updateCompetition(actor, Number(req.params.id), { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants: maxParticipants ? Number(maxParticipants) : undefined, status, rules, prizes });
+    res.json({ competition });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Error updating competition" });
+  }
+});
+
+app.delete("/api/admin/competitions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    await deleteCompetition(actor, Number(req.params.id));
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Error deleting competition" });
+  }
+});
+
+app.get("/api/admin/competitions/:id/registrations", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const registrations = await listCompetitionRegistrations(actor, Number(req.params.id));
+    res.json({ registrations });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Error loading registrations" });
+  }
+});
+
+app.delete("/api/admin/competitions/:id/registrations/:userId", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    await removeCompetitionRegistration(actor, Number(req.params.id), Number(req.params.userId));
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Error removing registration" });
+  }
+});
+
 app.get("/api/live-scores", optionalAuth, async (req, res) => {
   const actor = await attachActor(req);
   res.json({ matches: await listMatches(actor) });
@@ -1423,6 +1795,34 @@ app.get("/api/reservations", requireAuth, async (req, res) => {
     res.json({ reservations });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Une erreur est survenue" });
+  }
+});
+
+app.get("/api/reservations/:id", requireAuth, async (req, res, next) => {
+  if (!/^\d+$/.test(String(req.params.id))) return next();
+  try {
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "Authentication required" });
+    const reservation = await getReservationForUser(Number(req.params.id), actor);
+    if (!reservation) return res.status(404).json({ message: "Reservation not found" });
+    res.json({ reservation });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load reservation";
+    res.status(message.includes("access") ? 403 : 400).json({ message });
+  }
+});
+
+app.get("/api/reservations/:id/details", requireAuth, async (req, res, next) => {
+  if (!/^\d+$/.test(String(req.params.id))) return next();
+  try {
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "Authentication required" });
+    const reservation = await getReservationForUser(Number(req.params.id), actor);
+    if (!reservation) return res.status(404).json({ message: "Reservation not found" });
+    res.json({ reservation });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load reservation";
+    res.status(message.includes("access") ? 403 : 400).json({ message });
   }
 });
 
@@ -1462,7 +1862,7 @@ app.get("/api/reservations/:id/ticket-link", requireAuth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ message: "Reservation not found" });
     if (rows[0].payment_status !== "paid") return res.status(402).json({ message: "Payment required" });
-    const url = `${PUBLIC_SERVER_URL}/public/tickets/${reservationId}/download?qr=${rows[0].qr_token}`;
+    const url = `${PUBLIC_SERVER_URL}/public/tickets/${reservationId}/download?qr=${encodeURIComponent(rows[0].qr_token)}`;
     return res.json({ url });
   } catch (error) {
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to get ticket link" });
@@ -1479,11 +1879,14 @@ app.get("/public/tickets/:id/download", async (req, res) => {
 
     const ticket = await getReservationTicketDetailsByQr(reservationId, qr);
     const pdfBuffer = generateReservationTicketPdfBuffer(ticket);
+    res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename=\"ultima-reservation-${ticket.id}.pdf\"`);
     return res.status(200).send(pdfBuffer);
   } catch (error) {
-    return res.status(400).json({ message: error instanceof Error ? error.message : "Invalid ticket link" });
+    const message = error instanceof Error ? error.message : "Invalid ticket link";
+    const status = message.includes("Payment required") ? 402 : 404;
+    return res.status(status).json({ message });
   }
 });
 
@@ -2136,6 +2539,7 @@ app.get("/api/admin/overview", requireAuth, requireAdmin, async (req, res) => {
     }
     res.json(await getAdminOverview(actor));
   } catch (error) {
+    console.error("[admin/overview] ERROR:", error);
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load admin overview" });
   }
 });
@@ -2198,6 +2602,8 @@ app.patch("/api/admin/users/:id/status", requireAuth, requireAdmin, async (req, 
     }
     const { status } = req.body ?? {};
     const user = await updateMembershipStatus(actor, Number(req.params.id), status);
+    // Invalidate role cache so suspension/activation is reflected immediately
+    await invalidateRoleCache(Number(req.params.id));
     return res.json({ user: sanitizeUser(user) });
   } catch (error) {
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to update user status" });
@@ -2211,7 +2617,25 @@ app.patch("/api/admin/users/:id/role", requireAuth, requireAdmin, async (req, re
       return res.status(401).json({ message: "User not found" });
     }
     const nextRole = String(req.body?.role ?? "").trim().toLowerCase();
-    const user = await updateMembershipRole(actor, Number(req.params.id), nextRole, req.body?.arenaId ? Number(req.body.arenaId) : null);
+    // Capture previous role for audit log
+    const targetId = Number(req.params.id);
+    const previousUser = await getUserById(targetId);
+    const previousRole = previousUser ? (sanitizeUser(previousUser).role ?? null) : null;
+    const actorArenaId = actor.arena_id ?? null;
+
+    const user = await updateMembershipRole(actor, targetId, nextRole, req.body?.arenaId ? Number(req.body.arenaId) : null);
+
+    // Invalidate role cache so the new role is reflected immediately
+    await invalidateRoleCache(targetId);
+
+    // Write audit log entry (fire-and-forget — never block the response)
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    pgPool.query(
+      `INSERT INTO audit_log (actor_user_id, action, target_type, target_id, before_json, after_json, arena_id, ip_address)
+       VALUES ($1, $2, 'user', $3::text, $4, $5, $6, $7::inet)`,
+      [req.userId, 'ROLE_CHANGE', req.params.id, JSON.stringify({ before: previousRole }), JSON.stringify({ after: nextRole }), actorArenaId, req.ip]
+    ).catch(() => {});
+
     await createNotification({
       userId: user.id,
       title: "Role updated",
@@ -2248,6 +2672,34 @@ app.post("/api/admin/matches/finalize", requireAuth, requireAdmin, async (req, r
     return res.json(result);
   } catch (error) {
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to finalize match" });
+  }
+});
+
+app.get("/api/admin/courts", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const arenaFilter = actor.effective_role !== "super_admin"
+      ? `AND c.arena_id = ${Number(actor.arena_id)}`
+      : "";
+    const { rows } = await pgPool.query(`
+      SELECT c.id,
+             c.name,
+             c.sport,
+             c.status,
+             a.name AS arena_name,
+             c.arena_id,
+             SUBSTRING(c.opening_time::text, 1, 5) AS opening_time,
+             SUBSTRING(c.closing_time::text, 1, 5) AS closing_time
+      FROM courts c
+      JOIN arenas a ON a.id = c.arena_id
+      WHERE COALESCE(c.soft_deleted, false) = false ${arenaFilter}
+      ORDER BY a.name, c.name
+    `);
+    res.json({ courts: rows });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to load courts" });
   }
 });
 
@@ -2306,6 +2758,146 @@ app.patch("/api/admin/reservations/:id/status", requireAuth, requireAdmin, async
     return res.json({ success: true });
   } catch (error) {
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to update reservation status" });
+  }
+});
+
+// Enhanced admin reservations: includes booking_type, payment_status, coach_name, date filter
+app.get("/api/admin/reservations/v2", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const { date } = req.query;
+    const params = [];
+    const conditions = [];
+    if (actor.effective_role !== "super_admin") {
+      params.push(actor.arena_id);
+      conditions.push(`c.arena_id = $${params.length}`);
+    }
+    if (date) {
+      params.push(date);
+      conditions.push(`r.reservation_date = $${params.length}::date`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const { rows } = await pgPool.query(`
+      SELECT r.id,
+             r.reservation_date::text,
+             SUBSTRING(r.start_time::text, 1, 5)   AS start_time,
+             SUBSTRING(r.end_time::text, 1, 5)     AS end_time,
+             r.status,
+             r.notes,
+             r.created_at,
+             r.qr_token,
+             COALESCE(r.payment_status, 'pending')  AS payment_status,
+             COALESCE(r.booking_type, 'court')       AS booking_type,
+             c.name  AS court_name,
+             a.name  AS arena_name,
+             u.email AS owner_email,
+             u.first_name || ' ' || u.last_name AS owner_name,
+             (SELECT u2.first_name || ' ' || u2.last_name
+                FROM coaching_requests cr
+                JOIN users u2 ON u2.id = cr.coach_user_id
+               WHERE cr.coaching_reservation_id = r.id
+               LIMIT 1) AS coach_name
+      FROM reservations r
+      JOIN courts c ON c.id = r.court_id
+      JOIN arenas a ON a.id = c.arena_id
+      JOIN users  u ON u.id = r.user_id
+      ${where}
+      ORDER BY r.reservation_date DESC, r.start_time DESC
+    `, params);
+    res.json({
+      reservations: rows.map(row => ({
+        ...row,
+        special_code: `ULT-${row.id}-${String(row.qr_token ?? "").slice(0, 8).toUpperCase()}`,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to load reservations" });
+  }
+});
+
+// Court blocks — admin-managed unavailability slots
+app.get("/api/admin/court-blocks", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ message: "date query param required" });
+    const params = [date];
+    const arenaFilter = actor.effective_role !== "super_admin"
+      ? `AND c.arena_id = $${params.push(actor.arena_id) && params.length}`
+      : "";
+    const { rows } = await pgPool.query(`
+      SELECT cb.id,
+             cb.court_id,
+             c.name AS court_name,
+             cb.block_date::text,
+             SUBSTRING(cb.start_time::text, 1, 5) AS start_time,
+             SUBSTRING(cb.end_time::text, 1, 5)   AS end_time,
+             cb.reason,
+             cb.created_at
+      FROM court_blocks cb
+      JOIN courts c ON c.id = cb.court_id
+      WHERE cb.block_date = $1::date ${arenaFilter}
+      ORDER BY cb.start_time
+    `, params);
+    res.json({ blocks: rows });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to load court blocks" });
+  }
+});
+
+app.post("/api/admin/court-blocks", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const { courtId, date, startTime, endTime, reason } = req.body;
+    if (!courtId || !date || !startTime || !endTime) {
+      return res.status(400).json({ message: "courtId, date, startTime, endTime required" });
+    }
+    // Verify court belongs to admin's arena
+    if (actor.effective_role !== "super_admin") {
+      const { rows: courtRows } = await pgPool.query(
+        "SELECT id FROM courts WHERE id = $1 AND arena_id = $2", [courtId, actor.arena_id]
+      );
+      if (!courtRows.length) return res.status(403).json({ message: "Court not in your arena" });
+    }
+    const { rows } = await pgPool.query(`
+      INSERT INTO court_blocks (court_id, block_date, start_time, end_time, reason, created_by)
+      VALUES ($1, $2::date, $3::time, $4::time, $5, $6)
+      RETURNING id, court_id, block_date::text,
+        SUBSTRING(start_time::text,1,5) AS start_time,
+        SUBSTRING(end_time::text,1,5)   AS end_time,
+        reason, created_at
+    `, [courtId, date, startTime, endTime, reason ?? null, actor.id]);
+    res.status(201).json({ block: rows[0] });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to create block" });
+  }
+});
+
+app.delete("/api/admin/court-blocks/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const blockId = Number(req.params.id);
+    if (actor.effective_role !== "super_admin") {
+      const { rows } = await pgPool.query(
+        `SELECT cb.id FROM court_blocks cb
+         JOIN courts c ON c.id = cb.court_id
+         WHERE cb.id = $1 AND c.arena_id = $2`,
+        [blockId, actor.arena_id]
+      );
+      if (!rows.length) return res.status(403).json({ message: "Block not found in your arena" });
+    }
+    await pgPool.query("DELETE FROM court_blocks WHERE id = $1", [blockId]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to delete block" });
   }
 });
 
@@ -2519,10 +3111,28 @@ app.get("/api/live-sessions/:id/source-video", async (req, res) => {
     const session = await getLiveSessionById(req.params.id);
     if (!session) return res.status(404).json({ message: "Live session not found" });
     if (!(await canViewLiveSession(actor, session))) return res.status(403).json({ message: "Live session access denied" });
-    if (session.cameraType !== "file_demo") return res.status(400).json({ message: "Live source preview is only available for file_demo cameras." });
-    if (!session.cameraUrl) return res.status(404).json({ message: "No camera source is configured for this live session." });
+    const isFileDemo = session.cameraType === "file_demo" || session.mode === "file_demo" || session.mode === "local_demo";
+    if (!isFileDemo) return res.status(400).json({ message: "Live source preview is only available for file_demo sessions." });
 
-    return sendLocalVideoFile(res, session.cameraUrl, "Live source video file was not found.");
+    let cameraUrl = session.cameraUrl;
+    if (!cameraUrl) {
+      const defaultSrc = process.env.SMARTPLAY_DEFAULT_FILE_DEMO_SOURCE;
+      if (!defaultSrc) return res.status(404).json({ message: "No camera source is configured for this live session." });
+      cameraUrl = defaultSrc;
+    }
+
+    // Resolve relative paths — try CWD, then workspace root (parent of Ultima_web), then smartplay_ai subdir
+    if (!path.isAbsolute(cameraUrl)) {
+      const candidates = [
+        path.resolve(process.cwd(), cameraUrl),
+        path.resolve(process.cwd(), "..", cameraUrl),
+        path.resolve(process.cwd(), "..", "smartplay_ai", cameraUrl),
+      ];
+      const found = candidates.find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
+      cameraUrl = found ?? candidates[0];
+    }
+
+    return sendLocalVideoFile(res, cameraUrl, "Live source video file was not found.");
   } catch (error) {
     return res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load live source video." });
   }
@@ -2547,6 +3157,13 @@ app.get("/api/live-sessions/:id/rendered-stream", async (req, res) => {
     if (!session) return res.status(404).json({ message: "Live session not found" });
     if (!(await canViewLiveSession(actor, session))) return res.status(403).json({ message: "Live session access denied" });
     if (!session.aiSessionId) return res.status(404).json({ message: "Rendered stream is not ready yet." });
+    // Block only subprocess-based dev sessions (no real rendered MJPEG from FastAPI).
+    // file_demo sessions that went through /live/start have a real aiSessionId like "live-N-abc".
+    const devPrefixes = ["filedemo-", "mock-", "local-"];
+    const isDevSession =
+      ["mock", "local_demo"].includes(String(session.mode ?? "").toLowerCase()) ||
+      (typeof session.aiSessionId === "string" && devPrefixes.some((p) => session.aiSessionId.startsWith(p)));
+    if (isDevSession) return res.status(404).json({ message: "No rendered stream for this session type." });
     if (!SMARTPLAY_AI_URL) return sendSmartPlayNotConfigured(res);
 
     const response = await fetchSmartPlay(`/live/rendered/${encodeURIComponent(session.aiSessionId)}.mjpg`);
@@ -2573,15 +3190,23 @@ app.post("/api/live-sessions", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.post("/api/live-sessions/:id/start", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/live-sessions/:id/start", requireAuth, async (req, res) => {
   let startingSessionId = null;
   try {
     const actor = await attachActor(req);
     const existing = await getLiveSessionById(req.params.id);
     if (!existing) return res.status(404).json({ message: "Live session not found" });
-    if (!(await canManageLiveSession(actor, existing.arenaId))) return res.status(403).json({ message: "Admin access denied" });
 
-    const mode = String(req.body?.mode ?? existing.mode ?? "real").trim().toLowerCase();
+    let mode = String(req.body?.mode ?? existing.mode ?? "real").trim().toLowerCase();
+    // A file_demo camera can't run real AI — promote automatically so "Start Analysis" just works.
+    if (mode === "real" && existing.cameraType === "file_demo") mode = "file_demo";
+    const isDevMode = ["mock", "file_demo", "local_demo"].includes(mode);
+
+    // Real sessions require arena admin; dev/demo sessions allow any authenticated user
+    if (!isDevMode && !(await canManageLiveSession(actor, existing.arenaId))) {
+      return res.status(403).json({ message: "Admin access required to start real live sessions." });
+    }
+
     startingSessionId = existing.id;
     await updateLiveSessionStatus({ sessionId: existing.id, status: "starting", message: mode === "mock" ? "Starting mock visual stream." : "Starting SmartPlay AI live analysis." });
 
@@ -2591,8 +3216,85 @@ app.post("/api/live-sessions/:id/start", requireAuth, requireAdmin, async (req, 
       }
       await updateLiveSessionStatus({ sessionId: existing.id, status: "running", message: "Mock visual analysis running.", aiSessionId: `mock-${existing.id}` });
       startMockLiveSession(existing.id);
-      io.to(liveRoom(existing.id)).emit("live:status", { sessionId: existing.id, status: "running", message: "Mock visual analysis running." });
+      if (io) emitLiveStatus(io, existing.id, { sessionId: existing.id, status: "running", message: "Mock visual analysis running." });
       return res.json({ session: await getLiveSessionById(existing.id), mock: true });
+    }
+
+    if (mode === "file_demo") {
+      if (String(existing.mode ?? "").toLowerCase() !== "file_demo") {
+        await patchLiveSession(existing.id, { mode: "file_demo" });
+      }
+
+      // Prefer FastAPI mode (full rendered MJPEG + callbacks) unless explicitly set to subprocess.
+      // If FastAPI is starting up (auto-started at launch), wait up to 60s for it to be ready.
+      const preferFastApi = SMARTPLAY_AI_URL && process.env.SMARTPLAY_FILE_DEMO_MODE !== "subprocess";
+      if (preferFastApi) {
+        if (io) emitLiveStatus(io, existing.id, { sessionId: existing.id, status: "starting", message: "Waiting for SmartPlay AI service…" });
+        await tryStartFastApiService().catch(() => {});
+        try {
+          const session = await getLiveSessionById(existing.id);
+          const result = await startRealLiveSession(session);
+          return res.json({ ...result, file_demo: true });
+        } catch (fastApiErr) {
+          const msg = String(fastApiErr?.message ?? "").toLowerCase();
+          const isNetworkError = fastApiErr instanceof TypeError ||
+            msg.includes("fetch failed") ||
+            msg.includes("econnrefused") ||
+            fastApiErr?.name === "AbortError";
+          if (!isNetworkError) throw fastApiErr; // real config error — propagate
+          console.warn(`[file_demo:${existing.id}] FastAPI unavailable (${fastApiErr.message}); using subprocess fallback.`);
+          // fall through to subprocess
+        }
+      }
+
+      // ── Subprocess fallback ──────────────────────────────────────────────
+      const aiSessionId = `filedemo-${existing.id}-${Date.now()}`;
+      await updateLiveSessionStatus({
+        sessionId: existing.id,
+        status: "starting",
+        message: "File demo subprocess starting…",
+        aiSessionId,
+      });
+      if (io) emitLiveStatus(io, existing.id, { sessionId: existing.id, status: "starting", message: "File demo subprocess starting…" });
+      try {
+        startFileDemoProcess(existing.id);
+      } catch (spawnErr) {
+        await updateLiveSessionStatus({ sessionId: existing.id, status: "error", message: spawnErr.message }).catch(() => {});
+        throw spawnErr;
+      }
+      const session = await getLiveSessionById(existing.id);
+      return res.json({ session, file_demo: true, aiSessionId });
+    }
+
+    if (mode === "local_demo") {
+      // Treat local_demo the same as file_demo — promote and auto-spawn.
+      await patchLiveSession(existing.id, { mode: "file_demo" });
+      const promoted = await getLiveSessionById(existing.id);
+      mode = "file_demo";
+      // Re-enter file_demo path via startRealLiveSession / subprocess (same as above).
+      const preferFastApi2 = SMARTPLAY_AI_URL && process.env.SMARTPLAY_FILE_DEMO_MODE !== "subprocess";
+      if (preferFastApi2) {
+        if (io) emitLiveStatus(io, existing.id, { sessionId: existing.id, status: "starting", message: "Waiting for SmartPlay AI service…" });
+        await tryStartFastApiService().catch(() => {});
+        try {
+          const result = await startRealLiveSession(promoted);
+          return res.json({ ...result, file_demo: true });
+        } catch (err2) {
+          const msg2 = String(err2?.message ?? "").toLowerCase();
+          const isNet = err2 instanceof TypeError || msg2.includes("fetch failed") || msg2.includes("econnrefused") || err2?.name === "AbortError";
+          if (!isNet) throw err2;
+          console.warn(`[local_demo→file_demo:${existing.id}] FastAPI unavailable; using subprocess.`);
+        }
+      }
+      const localAiSessionId = `filedemo-${existing.id}-${Date.now()}`;
+      await updateLiveSessionStatus({ sessionId: existing.id, status: "starting", message: "File demo subprocess starting…", aiSessionId: localAiSessionId });
+      if (io) emitLiveStatus(io, existing.id, { sessionId: existing.id, status: "starting", message: "File demo subprocess starting…" });
+      try { startFileDemoProcess(existing.id); } catch (e) {
+        await updateLiveSessionStatus({ sessionId: existing.id, status: "error", message: e.message }).catch(() => {});
+        throw e;
+      }
+      const promotedSession = await getLiveSessionById(existing.id);
+      return res.json({ session: promotedSession, file_demo: true, aiSessionId: localAiSessionId });
     }
 
     const result = await startRealLiveSession(existing);
@@ -2618,6 +3320,37 @@ app.post("/api/live-sessions/:id/stop", requireAuth, requireAdmin, async (req, r
     res.json({ session: await stopLiveSession(existing) });
   } catch (error) {
     res.status(error.statusCode ?? 400).json({ message: error instanceof Error ? error.message : "Unable to stop live session" });
+  }
+});
+
+app.delete("/api/live-sessions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const existing = await getLiveSessionById(req.params.id);
+    if (!existing) return res.status(404).json({ message: "Live session not found" });
+    if (!(await canManageLiveSession(actor, existing.arenaId))) return res.status(403).json({ message: "Access denied" });
+    if (existing.status === "running" || existing.status === "starting") {
+      await stopLiveSession(existing).catch(() => {});
+    }
+    await deleteLiveSession(existing.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to delete live session" });
+  }
+});
+
+app.patch("/api/live-sessions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    const existing = await getLiveSessionById(req.params.id);
+    if (!existing) return res.status(404).json({ message: "Live session not found" });
+    if (!(await canManageLiveSession(actor, existing.arenaId))) return res.status(403).json({ message: "Access denied" });
+    const { mode, courtId } = req.body ?? {};
+    if (mode === undefined && courtId === undefined) return res.status(400).json({ message: "Nothing to update" });
+    await patchLiveSession(existing.id, { mode, courtId });
+    res.json({ session: await getLiveSessionById(existing.id) });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to update live session" });
   }
 });
 
@@ -2687,7 +3420,7 @@ app.post("/api/courts/:courtId/calibration", requireAuth, requireAdmin, async (r
 app.post("/api/smartplay/live/:sessionId/update", requireSmartPlayCallback, async (req, res) => {
   try {
     const session = await recordLiveUpdate({ sessionId: req.params.sessionId, payload: req.body ?? {}, sample: Boolean(req.body?.sample) });
-    io.to(liveRoom(req.params.sessionId)).emit("live:update", { sessionId: Number(req.params.sessionId), ...(req.body ?? {}) });
+    if (io) emitLiveUpdate(io, req.params.sessionId, { sessionId: Number(req.params.sessionId), ...(req.body ?? {}) });
     res.json({ ok: true, session });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to accept live update" });
@@ -2699,7 +3432,7 @@ app.post("/api/smartplay/live/:sessionId/status", requireSmartPlayCallback, asyn
     const status = String(req.body?.status ?? "running");
     const message = req.body?.message ? String(req.body.message) : null;
     const session = await updateLiveSessionStatus({ sessionId: req.params.sessionId, status, message, aiSessionId: req.body?.aiSessionId ?? req.body?.ai_session_id ?? null });
-    io.to(liveRoom(req.params.sessionId)).emit("live:status", { sessionId: Number(req.params.sessionId), status, message });
+    if (io) emitLiveStatus(io, req.params.sessionId, { sessionId: Number(req.params.sessionId), status, message });
     res.json({ ok: true, session });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to accept live status" });
@@ -2710,7 +3443,7 @@ app.post("/api/smartplay/live/:sessionId/error", requireSmartPlayCallback, async
   try {
     const message = req.body?.message ? String(req.body.message) : "SmartPlay AI live analysis error.";
     const session = await updateLiveSessionStatus({ sessionId: req.params.sessionId, status: "error", message });
-    io.to(liveRoom(req.params.sessionId)).emit("live:error", { sessionId: Number(req.params.sessionId), message, detail: req.body ?? {} });
+    if (io) io.to(liveRoom(req.params.sessionId)).emit("live:error", { sessionId: Number(req.params.sessionId), message, detail: req.body ?? {} });
     res.json({ ok: true, session });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to accept live error" });
@@ -2741,22 +3474,19 @@ async function tickReservationLiveAnalysis() {
   }
 }
 
-io.on("connection", async (socket) => {
-  try {
-    socket.emit("scores:update", { matches: await listMatches() });
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error("Unable to push initial live scores:", error);
-  }
-
-  socket.on("live:join", ({ sessionId } = {}) => {
-    if (sessionId) socket.join(liveRoom(sessionId));
+// Socket.IO connection handler — io is initialised after DB init above
+// The new initSocketIO already calls setupChannels() which handles live:join/leave
+// and other channel subscriptions. We wire the legacy initial scores push here.
+if (io) {
+  io.on("connection", async (socket) => {
+    try {
+      socket.emit("scores:update", { matches: await listMatches() });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("Unable to push initial live scores:", error);
+    }
   });
-
-  socket.on("live:leave", ({ sessionId } = {}) => {
-    if (sessionId) socket.leave(liveRoom(sessionId));
-  });
-});
+}
 
 // ── Smart Scoring ────────────────────────────────────────────────────────────
 
@@ -2802,7 +3532,7 @@ app.patch("/api/matches/:id/score", requireAuth, async (req, res) => {
       actorRole: role,
       reason,
     });
-    io.emit("scores:update", { matches: await listMatches() });
+    if (io) emitScoresUpdate(io, { matches: await listMatches() });
     res.json({ score: updated });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to update score" });
@@ -3812,7 +4542,7 @@ app.get("/api/smartplay/analysis-jobs", requireAuth, async (req, res) => {
 
 // ── Coaching: Coach self-management ──────────────────────────────────────────
 
-app.get("/api/coach/profile", requireAuth, async (req, res) => {
+app.get("/api/coach/profile", requireAuth, requireCoach, async (req, res) => {
   try {
     const profile = await getCoachProfile(req.user.sub);
     res.json({ profile });
@@ -3821,7 +4551,7 @@ app.get("/api/coach/profile", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/api/coach/profile", requireAuth, async (req, res) => {
+app.patch("/api/coach/profile", requireAuth, requireCoach, async (req, res) => {
   try {
     const profile = await upsertCoachProfile(req.user.sub, req.user.sub, req.body);
     res.json({ profile });
@@ -3830,7 +4560,7 @@ app.patch("/api/coach/profile", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/coach/profile/avatar", requireAuth, uploadImage.single("avatar"), async (req, res) => {
+app.post("/api/coach/profile/avatar", requireAuth, requireCoach, uploadImage.single("avatar"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
     const imageUrl = `/uploads/${req.file.filename}`;
@@ -3841,7 +4571,7 @@ app.post("/api/coach/profile/avatar", requireAuth, uploadImage.single("avatar"),
   }
 });
 
-app.get("/api/coach/availability", requireAuth, async (req, res) => {
+app.get("/api/coach/availability", requireAuth, requireCoach, async (req, res) => {
   try {
     const availability = await getCoachAvailability(req.user.sub);
     res.json(availability);
@@ -3850,27 +4580,52 @@ app.get("/api/coach/availability", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/coach/availability", requireAuth, async (req, res) => {
+app.put("/api/coach/availability", requireAuth, requireCoach, async (req, res) => {
   try {
-    const { rules } = req.body;
+    const { rules, sessionLimits } = req.body;
     if (!Array.isArray(rules)) return res.status(400).json({ message: "rules must be an array" });
     await setCoachAvailabilityRules(req.user.sub, rules);
-    res.json({ success: true });
+    if (sessionLimits && typeof sessionLimits === "object") {
+      await upsertCoachProfile(req.user.sub, req.user.sub, {
+        maxSessionsPerDay: sessionLimits.maxSessionsPerDay ?? null,
+        sessionDurationMinutes: sessionLimits.sessionDurationMinutes ?? 60,
+        cooldownMinutes: sessionLimits.cooldownMinutes ?? 0,
+      });
+    }
+    const availability = await getCoachAvailability(req.user.sub);
+    res.json(availability);
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to save availability" });
   }
 });
 
-app.post("/api/coach/availability/exceptions", requireAuth, async (req, res) => {
+app.post("/api/coach/availability/exceptions", requireAuth, requireCoach, async (req, res) => {
   try {
-    const exception = await addCoachAvailabilityException(req.user.sub, req.body);
+    const body = {
+      ...req.body,
+      date: req.body?.date ?? req.body?.exceptionDate ?? req.body?.exception_date,
+    };
+    const exception = await addCoachAvailabilityException(req.user.sub, body);
     res.status(201).json({ exception });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to add exception" });
   }
 });
 
-app.get("/api/coach/requests", requireAuth, async (req, res) => {
+app.delete("/api/coach/availability/exceptions/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    await pgPool.query(
+      "DELETE FROM coach_availability_exceptions WHERE id = $1 AND coach_user_id = $2",
+      [Number(req.params.id), Number(req.user.sub)]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to remove exception" });
+  }
+});
+
+app.get("/api/coach/requests", requireAuth, requireCoach, async (req, res) => {
   try {
     const requests = await listCoachingRequestsForCoach(req.user.sub);
     res.json({ requests });
@@ -3879,7 +4634,7 @@ app.get("/api/coach/requests", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/api/coach/requests/:id/respond", requireAuth, async (req, res) => {
+app.patch("/api/coach/requests/:id/respond", requireAuth, requireCoach, async (req, res) => {
   try {
     const result = await respondToCoachingRequest(req.user.sub, Number(req.params.id), req.body);
     res.json(result);
@@ -3888,12 +4643,196 @@ app.patch("/api/coach/requests/:id/respond", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/coach/coaching-sessions", requireAuth, async (req, res) => {
+app.get("/api/coach/coaching-sessions", requireAuth, requireCoach, async (req, res) => {
   try {
     const sessions = await listCoachingSessionsForUser(req.user.sub);
     res.json({ sessions });
   } catch (error) {
     res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load sessions" });
+  }
+});
+
+async function ensureCoachNotesTable(pgPool) {
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS coach_notes (
+      id SERIAL PRIMARY KEY,
+      coach_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      category VARCHAR(40) NOT NULL DEFAULT 'other',
+      body TEXT NOT NULL,
+      related_type VARCHAR(40) NULL,
+      related_id INT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pgPool.query("CREATE INDEX IF NOT EXISTS idx_coach_notes_coach_created ON coach_notes(coach_user_id, created_at DESC)");
+}
+
+async function listCoachNotesForUser(coachUserId) {
+  const { default: pgPool } = await import("./pg-pool.mjs");
+  await ensureCoachNotesTable(pgPool);
+  const { rows } = await pgPool.query(
+    `SELECT id, category, body, related_type, related_id, created_at
+     FROM coach_notes
+     WHERE coach_user_id = $1
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    [Number(coachUserId)]
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    category: row.category,
+    body: row.body,
+    relatedType: row.related_type,
+    relatedId: row.related_id,
+    createdAt: row.created_at,
+  }));
+}
+
+async function listCoachAiReviews(coachUserId) {
+  const { default: pgPool } = await import("./pg-pool.mjs");
+  const { rows: playerRows } = await pgPool.query(
+    `SELECT player_user_id
+     FROM coach_player_relationships
+     WHERE coach_user_id = $1 AND status = 'active'
+       AND start_date <= CURRENT_DATE
+       AND (end_date IS NULL OR end_date >= CURRENT_DATE)`,
+    [Number(coachUserId)]
+  );
+  const playerIds = playerRows.map((row) => Number(row.player_user_id)).filter(Number.isFinite);
+  if (!playerIds.length) return [];
+  const { rows } = await pgPool.query(
+    `SELECT c.*, CONCAT(u.first_name, ' ', u.last_name) AS player_name
+     FROM ai_uploaded_clips c
+     LEFT JOIN users u ON u.id = c.player_user_id
+     WHERE c.deleted_at IS NULL
+       AND (
+         c.player_user_id = ANY($1::int[])
+         OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements_text(COALESCE(c.assigned_player_ids::jsonb, '[]'::jsonb)) AS assigned(player_id)
+           WHERE assigned.player_id::int = ANY($1::int[])
+         )
+       )
+     ORDER BY c.created_at DESC
+     LIMIT 60`,
+    [playerIds]
+  );
+  const clips = rows.map((row) => ({
+    id: row.id,
+    playerUserId: row.player_user_id,
+    playerName: row.player_name,
+    originalFilename: row.original_filename,
+    status: row.status,
+    createdAt: row.created_at,
+    sharedAt: row.shared_at,
+  }));
+  return Promise.all(clips.map(async (clip) => {
+    const details = await getAiClipDetails(clip.id).catch(() => null);
+    return { ...clip, job: details?.job ?? null };
+  }));
+}
+
+async function getCoachPaymentsSummary(coachUserId) {
+  const { default: pgPool } = await import("./pg-pool.mjs");
+  const { rows } = await pgPool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE payment_status = 'paid') AS paid_sessions,
+       COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_sessions,
+       COUNT(*) FILTER (WHERE payment_status = 'refunded') AS refunded_sessions,
+       SUM(payment_amount) FILTER (WHERE payment_status = 'paid') AS estimated_earnings
+     FROM coaching_requests
+     WHERE coach_user_id = $1`,
+    [Number(coachUserId)]
+  );
+  const row = rows[0] ?? {};
+  return {
+    paidSessions: Number(row.paid_sessions ?? 0),
+    cancelledSessions: Number(row.cancelled_sessions ?? 0),
+    refundedSessions: Number(row.refunded_sessions ?? 0),
+    estimatedEarnings: row.estimated_earnings === null || row.estimated_earnings === undefined ? null : Number(row.estimated_earnings),
+    currency: "TND",
+  };
+}
+
+app.get("/api/coach/notes", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const notes = await listCoachNotesForUser(req.user.sub);
+    res.json({ notes });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load notes" });
+  }
+});
+
+app.post("/api/coach/notes", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    await ensureCoachNotesTable(pgPool);
+    const allowed = new Set(["positioning", "technique", "defense", "attack", "movement", "fitness", "tactical", "other"]);
+    const category = allowed.has(String(req.body?.category)) ? String(req.body.category) : "other";
+    const body = String(req.body?.body ?? "").trim();
+    if (!body) return res.status(400).json({ message: "Note body is required" });
+    const { rows } = await pgPool.query(
+      `INSERT INTO coach_notes (coach_user_id, category, body, related_type, related_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, category, body, related_type, related_id, created_at`,
+      [Number(req.user.sub), category, body, req.body?.relatedType ?? null, req.body?.relatedId ? Number(req.body.relatedId) : null]
+    );
+    res.status(201).json({
+      note: {
+        id: rows[0].id,
+        category: rows[0].category,
+        body: rows[0].body,
+        relatedType: rows[0].related_type,
+        relatedId: rows[0].related_id,
+        createdAt: rows[0].created_at,
+      },
+    });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to save note" });
+  }
+});
+
+app.get("/api/coach/ai-reviews", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const reviews = await listCoachAiReviews(req.user.sub);
+    res.json({ reviews });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load AI reviews" });
+  }
+});
+
+app.get("/api/coach/dashboard", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const [
+      students,
+      sessions,
+      coachingSessions,
+      requests,
+      availability,
+      notifications,
+      liveSessions,
+      competitions,
+      aiReviews,
+      notes,
+      payments,
+    ] = await Promise.all([
+      listCoachStudents(req.user.sub).catch(() => []),
+      listCoachSessions(req.user.sub).catch(() => []),
+      listCoachingSessionsForUser(req.user.sub).catch(() => []),
+      listCoachingRequestsForCoach(req.user.sub).catch(() => []),
+      getCoachAvailability(req.user.sub).catch(() => ({ rules: [], exceptions: [] })),
+      listNotificationsForUser(req.user.sub).catch(() => []),
+      listLiveSessions({ actor }).catch(() => []),
+      listCompetitions().catch(() => []),
+      listCoachAiReviews(req.user.sub).catch(() => []),
+      listCoachNotesForUser(req.user.sub).catch(() => []),
+      getCoachPaymentsSummary(req.user.sub).catch(() => ({ paidSessions: 0, cancelledSessions: 0, refundedSessions: 0, estimatedEarnings: null, currency: "TND" })),
+    ]);
+    res.json({ students, sessions, coachingSessions, requests, availability, notifications, liveSessions, competitions, aiReviews, notes, payments });
+  } catch (error) {
+    res.status(400).json({ message: error instanceof Error ? error.message : "Unable to load coach dashboard" });
   }
 });
 
@@ -3992,6 +4931,262 @@ app.patch("/api/admin/coaches/:id/profile", requireAuth, async (req, res) => {
   }
 });
 
+// Admin: read a coach's availability (rules + exceptions)
+app.get("/api/admin/coaches/:id/availability", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const coachId = Number(req.params.id);
+    if (actor.effective_role !== "super_admin") {
+      const { rows } = await pgPool.query(
+        `SELECT u.id FROM users u
+         LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+         LEFT JOIN arena_memberships am ON am.user_id = u.id AND am.role = 'coach'
+         WHERE u.id = $1 AND (cp.arena_id = $2 OR am.arena_id = $2)`,
+        [coachId, actor.arena_id]
+      );
+      if (!rows.length) return res.status(403).json({ message: "Coach not in your arena" });
+    }
+    const [rulesRes, excRes, profileRes] = await Promise.all([
+      pgPool.query(
+        `SELECT id, day_of_week, SUBSTRING(start_time::text,1,5) AS start_time,
+                SUBSTRING(end_time::text,1,5) AS end_time, is_available
+         FROM coach_availability_rules WHERE coach_user_id = $1 ORDER BY day_of_week, start_time`,
+        [coachId]
+      ),
+      pgPool.query(
+        `SELECT id, exception_date::text AS date,
+                SUBSTRING(start_time::text,1,5) AS start_time,
+                SUBSTRING(end_time::text,1,5) AS end_time,
+                is_available, reason
+         FROM coach_availability_exceptions WHERE coach_user_id = $1 ORDER BY exception_date`,
+        [coachId]
+      ),
+      pgPool.query(
+        `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+        [coachId]
+      ),
+    ]);
+    const p = profileRes.rows[0];
+    res.json({
+      rules: rulesRes.rows,
+      exceptions: excRes.rows,
+      sessionLimits: {
+        maxSessionsPerDay: p?.max_sessions_per_day ?? null,
+        sessionDurationMinutes: p?.session_duration_minutes ?? 60,
+        cooldownMinutes: p?.cooldown_minutes ?? 0,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to load availability" });
+  }
+});
+
+// Admin: replace all availability rules for a coach + notify
+app.put("/api/admin/coaches/:id/availability", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const coachId = Number(req.params.id);
+    const { rules, message: adminMessage, sessionLimits } = req.body;
+    if (!Array.isArray(rules)) return res.status(400).json({ message: "rules must be array" });
+    if (actor.effective_role !== "super_admin") {
+      const { rows } = await pgPool.query(
+        `SELECT u.id FROM users u
+         LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+         LEFT JOIN arena_memberships am ON am.user_id = u.id AND am.role = 'coach'
+         WHERE u.id = $1 AND (cp.arena_id = $2 OR am.arena_id = $2)`,
+        [coachId, actor.arena_id]
+      );
+      if (!rows.length) return res.status(403).json({ message: "Coach not in your arena" });
+    }
+    const client = await pgPool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM coach_availability_rules WHERE coach_user_id = $1", [coachId]);
+      for (const rule of rules) {
+        const dow = Number(rule.dayOfWeek ?? rule.day_of_week);
+        if (dow < 0 || dow > 6 || !rule.startTime || !rule.endTime) continue;
+        await client.query(
+          `INSERT INTO coach_availability_rules (coach_user_id, arena_id, day_of_week, start_time, end_time, is_available)
+           VALUES ($1, $2, $3, $4::time, $5::time, $6)`,
+          [coachId, actor.arena_id ?? null, dow, rule.startTime, rule.endTime, rule.isAvailable !== false]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+    // Notify coach
+    const notifBody = adminMessage
+      ? adminMessage
+      : "Your weekly schedule has been updated by the arena admin.";
+    try {
+      await createNotification({
+        userId: coachId,
+        title: "Schedule updated by admin",
+        body: notifBody,
+        type: "schedule_update",
+        linkUrl: "/coach",
+      });
+    } catch (_) {}
+    if (sessionLimits && typeof sessionLimits === "object") {
+      await upsertCoachProfile(req.user.sub, coachId, {
+        maxSessionsPerDay: sessionLimits.maxSessionsPerDay ?? null,
+        sessionDurationMinutes: sessionLimits.sessionDurationMinutes ?? 60,
+        cooldownMinutes: sessionLimits.cooldownMinutes ?? 0,
+      });
+    }
+    const [rulesRes, excRes, profileRes] = await Promise.all([
+      pgPool.query(
+        `SELECT id, day_of_week, SUBSTRING(start_time::text,1,5) AS start_time,
+                SUBSTRING(end_time::text,1,5) AS end_time, is_available
+         FROM coach_availability_rules WHERE coach_user_id = $1 ORDER BY day_of_week, start_time`,
+        [coachId]
+      ),
+      pgPool.query(
+        `SELECT id, exception_date::text AS date,
+                SUBSTRING(start_time::text,1,5) AS start_time,
+                SUBSTRING(end_time::text,1,5) AS end_time,
+                is_available, reason
+         FROM coach_availability_exceptions WHERE coach_user_id = $1 ORDER BY exception_date`,
+        [coachId]
+      ),
+      pgPool.query(
+        `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+        [coachId]
+      ),
+    ]);
+    const p2 = profileRes.rows[0];
+    res.json({
+      rules: rulesRes.rows,
+      exceptions: excRes.rows,
+      sessionLimits: {
+        maxSessionsPerDay: p2?.max_sessions_per_day ?? null,
+        sessionDurationMinutes: p2?.session_duration_minutes ?? 60,
+        cooldownMinutes: p2?.cooldown_minutes ?? 0,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to update availability" });
+  }
+});
+
+// Admin: add a date exception (day off or override hours) for a coach
+app.post("/api/admin/coaches/:id/exceptions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const coachId = Number(req.params.id);
+    const { date, startTime, endTime, isAvailable, reason } = req.body;
+    if (!date) return res.status(400).json({ message: "date required" });
+    if (actor.effective_role !== "super_admin") {
+      const { rows } = await pgPool.query(
+        `SELECT u.id FROM users u
+         LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+         LEFT JOIN arena_memberships am ON am.user_id = u.id AND am.role = 'coach'
+         WHERE u.id = $1 AND (cp.arena_id = $2 OR am.arena_id = $2)`,
+        [coachId, actor.arena_id]
+      );
+      if (!rows.length) return res.status(403).json({ message: "Coach not in your arena" });
+    }
+    // Upsert: replace any existing exception for same coach+date
+    await pgPool.query(
+      `DELETE FROM coach_availability_exceptions WHERE coach_user_id = $1 AND exception_date = $2::date`,
+      [coachId, date]
+    );
+    const { rows } = await pgPool.query(
+      `INSERT INTO coach_availability_exceptions (coach_user_id, exception_date, start_time, end_time, is_available, reason)
+       VALUES ($1, $2::date, $3, $4, $5, $6)
+       RETURNING id, exception_date::text AS date,
+         SUBSTRING(start_time::text,1,5) AS start_time,
+         SUBSTRING(end_time::text,1,5) AS end_time, is_available, reason`,
+      [coachId, date, startTime ?? null, endTime ?? null, isAvailable !== false, reason ?? null]
+    );
+    try {
+      const label = isAvailable === false
+        ? `You are marked as unavailable on ${date}.`
+        : `Your hours on ${date} have been changed to ${startTime ?? ""}–${endTime ?? ""}.`;
+      await createNotification({
+        userId: coachId,
+        title: "Schedule exception added",
+        body: reason ? `${label} Reason: ${reason}` : label,
+        type: "schedule_update",
+        linkUrl: "/coach",
+      });
+    } catch (_) {}
+    res.status(201).json({ exception: rows[0] });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to add exception" });
+  }
+});
+
+// Admin: remove a date exception
+app.delete("/api/admin/coaches/:id/exceptions/:excId", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const coachId = Number(req.params.id);
+    const excId = Number(req.params.excId);
+    await pgPool.query(
+      `DELETE FROM coach_availability_exceptions WHERE id = $1 AND coach_user_id = $2`,
+      [excId, coachId]
+    );
+    try {
+      await createNotification({
+        userId: coachId,
+        title: "Schedule exception removed",
+        body: "A previously added schedule exception has been removed by the admin.",
+        type: "schedule_update",
+        linkUrl: "/coach",
+      });
+    } catch (_) {}
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to remove exception" });
+  }
+});
+
+// Admin: get coaching sessions for a coach (week view)
+app.get("/api/admin/coaches/:id/sessions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const coachId = Number(req.params.id);
+    const { weekStart } = req.query;
+    if (!weekStart) return res.status(400).json({ message: "weekStart required" });
+    const { rows } = await pgPool.query(
+      `SELECT cs.id,
+              cs.session_date::text,
+              SUBSTRING(cs.start_time::text,1,5) AS start_time,
+              SUBSTRING(cs.end_time::text,1,5)   AS end_time,
+              cs.status,
+              cs.players_count,
+              CONCAT(p.first_name,' ',p.last_name) AS player_name,
+              p.email AS player_email
+       FROM coaching_sessions cs
+       JOIN users p ON p.id = cs.player_user_id
+       WHERE cs.coach_user_id = $1
+         AND cs.session_date >= $2::date
+         AND cs.session_date < ($2::date + INTERVAL '7 days')
+         AND cs.status != 'cancelled'
+       ORDER BY cs.session_date, cs.start_time`,
+      [coachId, weekStart]
+    );
+    res.json({ sessions: rows });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : "Unable to load sessions" });
+  }
+});
+
 app.post("/api/admin/assign-coach-club", requireAuth, async (req, res) => {
   try {
     const { coachUserId, arenaId } = req.body;
@@ -4061,7 +5256,7 @@ app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
 setInterval(async () => {
   try {
     await tickLiveMatches();
-    io.emit("scores:update", { matches: await listMatches() });
+    if (io) emitScoresUpdate(io, { matches: await listMatches() });
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error("Live score loop error:", error);
@@ -4098,8 +5293,213 @@ httpServer.listen(PORT, () => {
     );
     console.log("[ULTIMA TEST ACCOUNTS] password source: env ULTIMA_TEST_PASSWORD");
   }
+  if (isMailerConfigured()) {
+    console.log("[mailer] SMTP configured — emails will be sent.");
+  } else {
+    console.warn("[mailer] SMTP not configured — emails will NOT be sent. Set SMTP_HOST and SMTP_FROM in .env");
+  }
+  // Eagerly start SmartPlay AI FastAPI in the background so it is ready by the time the user starts a live session
+  if (SMARTPLAY_AI_URL && process.env.PYTHON_EXECUTABLE) {
+    tryStartFastApiService().catch((e) => console.warn("[smartplay-ai] Auto-start failed:", e.message));
+  }
 });
 
+// ── Super-admin: Arena & Court management ─────────────────────────────────────
+console.log("[routes] super-admin routes registered");
+
+function requireSuperAdmin(req, res, next) {
+  if (req.resolved?.effectiveRole !== "super_admin") {
+    return res.status(403).json({ message: "Super admin access required" });
+  }
+  return next();
+}
+
+// GET /api/super-admin/arenas — list all arenas with courts and calibration status
+app.get("/api/super-admin/arenas", requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    const { rows } = await pgPool.query(`
+      SELECT
+        a.id, a.name, a.slug, a.location, a.image_url, a.description, a.phone, a.website,
+        a.created_at,
+        COALESCE(json_agg(
+          json_build_object(
+            'id', c.id,
+            'name', c.name,
+            'sport', c.sport,
+            'court_type', c.court_type,
+            'status', c.status,
+            'has_summa', c.has_summa,
+            'price_per_hour', c.price_per_hour,
+            'opening_time', c.opening_time,
+            'closing_time', c.closing_time,
+            'is_active', COALESCE(c.is_active, true),
+            'calib_id', cc.id,
+            'calib_status', cc.status
+          ) ORDER BY c.name
+        ) FILTER (WHERE c.id IS NOT NULL AND COALESCE(c.status, 'active') != 'inactive'), '[]') AS courts
+      FROM arenas a
+      LEFT JOIN courts c ON c.arena_id = a.id AND COALESCE(c.status, 'active') != 'inactive'
+      LEFT JOIN court_calibrations cc ON cc.court_id = c.id AND cc.is_active = true
+      WHERE a.soft_deleted IS NOT TRUE
+      GROUP BY a.id
+      ORDER BY a.name ASC
+    `);
+    return res.json({ arenas: rows });
+  } catch (err) {
+    return res.status(500).json({ message: err instanceof Error ? err.message : "Failed to list arenas" });
+  }
+});
+
+// POST /api/super-admin/arenas — create arena (with optional image)
+app.post("/api/super-admin/arenas", requireAuth, requireSuperAdmin, uploadImage.single("image"), async (req, res) => {
+  try {
+    const { name, location, description, phone, website } = req.body ?? {};
+    if (!name || !location) return res.status(400).json({ message: "name and location are required" });
+
+    const image_url = req.file ? `/uploads/${req.file.filename}` : null;
+    const baseSlug = String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "arena";
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    let slug = baseSlug;
+    let arena = null;
+    for (let i = 0; i < 10; i++) {
+      try {
+        const { rows } = await pgPool.query(
+          `INSERT INTO arenas (name, slug, location, image_url, description, phone, website, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+           RETURNING id, name, slug, location, image_url, description, phone, website, created_at`,
+          [name.trim(), slug, location.trim(), image_url, description ?? null, phone ?? null, website ?? null]
+        );
+        arena = rows[0];
+        break;
+      } catch (e) {
+        if (e?.code !== "23505") throw e;
+        slug = `${baseSlug}-${Math.floor(Math.random() * 10000)}`;
+      }
+    }
+    if (!arena) return res.status(500).json({ message: "Could not generate unique slug" });
+    return res.status(201).json({ arena });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to create arena" });
+  }
+});
+
+// PATCH /api/super-admin/arenas/:id — update arena fields + optional image
+app.patch("/api/super-admin/arenas/:id", requireAuth, requireSuperAdmin, uploadImage.single("image"), async (req, res) => {
+  try {
+    const arenaId = Number(req.params.id);
+    const { name, location, description, phone, website } = req.body ?? {};
+    const { default: pgPool } = await import("./pg-pool.mjs");
+
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+    if (name     !== undefined) { sets.push(`name=$${idx++}`);        vals.push(name.trim()); }
+    if (location !== undefined) { sets.push(`location=$${idx++}`);    vals.push(location.trim()); }
+    if (description !== undefined) { sets.push(`description=$${idx++}`); vals.push(description); }
+    if (phone    !== undefined) { sets.push(`phone=$${idx++}`);       vals.push(phone || null); }
+    if (website  !== undefined) { sets.push(`website=$${idx++}`);     vals.push(website || null); }
+    if (req.file) { sets.push(`image_url=$${idx++}`); vals.push(`/uploads/${req.file.filename}`); }
+    if (!sets.length) return res.status(400).json({ message: "Nothing to update" });
+
+    vals.push(arenaId);
+    const { rows } = await pgPool.query(
+      `UPDATE arenas SET ${sets.join(",")} WHERE id=$${idx} RETURNING id,name,slug,location,image_url,description,phone,website`,
+      vals
+    );
+    if (!rows.length) return res.status(404).json({ message: "Arena not found" });
+    return res.json({ arena: rows[0] });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to update arena" });
+  }
+});
+
+// DELETE /api/super-admin/arenas/:id — soft delete
+app.delete("/api/super-admin/arenas/:id", requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    await pgPool.query(
+      "UPDATE arenas SET soft_deleted=true, deleted_at=NOW() WHERE id=$1",
+      [Number(req.params.id)]
+    );
+    return res.json({ deleted: true });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to delete arena" });
+  }
+});
+
+// POST /api/super-admin/courts — create court in any arena (super_admin only)
+app.post("/api/super-admin/courts", requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const actor = await attachActor(req);
+    if (!actor) return res.status(401).json({ message: "User not found" });
+    const { arenaId, name, sport, location, hasSumma, minPlayers, maxPlayers, openingTime, closingTime, courtType, pricePerHour } = req.body ?? {};
+    if (!arenaId || !name || !sport) return res.status(400).json({ message: "arenaId, name, sport required" });
+    const court = await createCourt({
+      actor,
+      arenaId: Number(arenaId),
+      name: String(name).trim(),
+      sport: String(sport).trim(),
+      location: String(location ?? "").trim(),
+      hasSumma,
+      minPlayers,
+      maxPlayers,
+      openingTime,
+      closingTime,
+    });
+    return res.status(201).json({ court });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to create court" });
+  }
+});
+
+// PATCH /api/super-admin/courts/:id — update court
+app.patch("/api/super-admin/courts/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const courtId = Number(req.params.id);
+    const { name, sport, location, hasSumma, openingTime, closingTime, pricePerHour, courtType } = req.body ?? {};
+    const { default: pgPool } = await import("./pg-pool.mjs");
+
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+    if (name        !== undefined) { sets.push(`name=$${idx++}`);          vals.push(name.trim()); }
+    if (sport       !== undefined) { sets.push(`sport=$${idx++}`);         vals.push(sport); }
+    if (location    !== undefined) { sets.push(`location=$${idx++}`);      vals.push(location); }
+    if (hasSumma    !== undefined) { sets.push(`has_summa=$${idx++}`);     vals.push(hasSumma ? 1 : 0); }
+    if (openingTime !== undefined) { sets.push(`opening_time=$${idx++}::time`); vals.push(openingTime); }
+    if (closingTime !== undefined) { sets.push(`closing_time=$${idx++}::time`); vals.push(closingTime); }
+    if (pricePerHour!== undefined) { sets.push(`price_per_hour=$${idx++}`); vals.push(pricePerHour); }
+    if (courtType   !== undefined) { sets.push(`court_type=$${idx++}`);    vals.push(courtType); }
+    if (!sets.length) return res.status(400).json({ message: "Nothing to update" });
+
+    vals.push(courtId);
+    const { rows } = await pgPool.query(
+      `UPDATE courts SET ${sets.join(",")} WHERE id=$${idx} RETURNING id,name,sport,court_type,status,has_summa,price_per_hour`,
+      vals
+    );
+    if (!rows.length) return res.status(404).json({ message: "Court not found" });
+    return res.json({ court: rows[0] });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to update court" });
+  }
+});
+
+// DELETE /api/super-admin/courts/:id — soft delete
+app.delete("/api/super-admin/courts/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { default: pgPool } = await import("./pg-pool.mjs");
+    await pgPool.query(
+      "UPDATE courts SET soft_deleted=true, deleted_at=NOW(), status='inactive' WHERE id=$1",
+      [Number(req.params.id)]
+    );
+    return res.json({ deleted: true });
+  } catch (err) {
+    return res.status(400).json({ message: err instanceof Error ? err.message : "Failed to delete court" });
+  }
+});
+
+// ── Error handler (must be last) ──────────────────────────────────────────────
 app.use((error, _req, res, next) => {
   if (!error) {
     return next();

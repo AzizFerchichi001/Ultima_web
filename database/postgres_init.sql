@@ -190,10 +190,13 @@ CREATE TABLE IF NOT EXISTS coach_profiles (
   years_experience    INT NULL,
   hourly_rate         NUMERIC(10,2) NULL,
   currency            VARCHAR(10) NOT NULL DEFAULT 'TND',
-  is_active           BOOLEAN NOT NULL DEFAULT true,
-  is_verified         BOOLEAN NOT NULL DEFAULT false,
-  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  is_active                BOOLEAN NOT NULL DEFAULT true,
+  is_verified              BOOLEAN NOT NULL DEFAULT false,
+  max_sessions_per_day     INT NULL DEFAULT NULL,
+  session_duration_minutes INT NOT NULL DEFAULT 60,
+  cooldown_minutes         INT NOT NULL DEFAULT 0,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS coach_availability_rules (
@@ -578,3 +581,8 @@ ON CONFLICT (arena_id, user_id) DO NOTHING;
 INSERT INTO reservation_participants (reservation_id, user_id)
 SELECT r.id, r.user_id FROM reservations r
 ON CONFLICT (reservation_id, user_id) DO NOTHING;
+
+-- ── Migrations: add session-limit columns to existing databases ───────────────
+ALTER TABLE coach_profiles ADD COLUMN IF NOT EXISTS max_sessions_per_day     INT NULL DEFAULT NULL;
+ALTER TABLE coach_profiles ADD COLUMN IF NOT EXISTS session_duration_minutes INT NOT NULL DEFAULT 60;
+ALTER TABLE coach_profiles ADD COLUMN IF NOT EXISTS cooldown_minutes         INT NOT NULL DEFAULT 0;

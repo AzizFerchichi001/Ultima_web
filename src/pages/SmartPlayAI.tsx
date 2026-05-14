@@ -3,13 +3,12 @@ import Layout from "@/components/Layout";
 import {
   Brain, Zap, Target, Activity, Clock3, CheckCircle2, AlertCircle,
   BarChart3, TrendingUp, MapPin, Eye, Cpu, Radio, Wifi, WifiOff,
-  RefreshCw, Plus, ChevronRight, Flame,
+  RefreshCw, Flame, Loader2, ChevronRight,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSessionUser } from "@/lib/session";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
-import { toast } from "sonner";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -47,28 +46,15 @@ type AiAnalysis = {
   createdAt: string;
 };
 
-type AiMetrics = {
-  available: boolean;
-  source: string;
-  message?: string;
-  placeholder?: {
-    movement_coverage: null;
-    reaction_speed_ms: null;
-    shot_accuracy: null;
-    winners: null;
-    errors: null;
-  };
-};
-
 // ── Status config ─────────────────────────────────────────────────────────────
 
 const statusConfig: Record<string, { label: string; cls: string; icon: typeof Clock3 }> = {
-  queued: { label: "Queued", cls: "bg-amber-500/15 text-amber-300 border-amber-500/20", icon: Clock3 },
-  processing: { label: "Processing", cls: "bg-blue-500/15 text-blue-300 border-blue-500/20 animate-pulse", icon: RefreshCw },
-  pending_ai: { label: "Pending AI", cls: "bg-purple-500/15 text-purple-300 border-purple-500/20", icon: Brain },
-  completed: { label: "Completed", cls: "bg-green-500/15 text-green-300 border-green-500/20", icon: CheckCircle2 },
-  ready: { label: "Ready", cls: "bg-green-500/15 text-green-300 border-green-500/20", icon: CheckCircle2 },
-  failed: { label: "Failed", cls: "bg-red-500/15 text-red-300 border-red-500/20", icon: AlertCircle },
+  queued:      { label: "Queued",      cls: "bg-amber-500/15 text-amber-300 border-amber-500/20",   icon: Clock3 },
+  processing:  { label: "Processing",  cls: "bg-blue-500/15 text-blue-300 border-blue-500/20 animate-pulse", icon: RefreshCw },
+  pending_ai:  { label: "Pending AI",  cls: "bg-purple-500/15 text-purple-300 border-purple-500/20", icon: Brain },
+  completed:   { label: "Completed",   cls: "bg-green-500/15 text-green-300 border-green-500/20",   icon: CheckCircle2 },
+  ready:       { label: "Ready",       cls: "bg-green-500/15 text-green-300 border-green-500/20",   icon: CheckCircle2 },
+  failed:      { label: "Failed",      cls: "bg-red-500/15 text-red-300 border-red-500/20",         icon: AlertCircle },
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -81,99 +67,71 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-// ── Feature tiles for AI roadmap ──────────────────────────────────────────────
+// ── AI Feature roadmap tiles ──────────────────────────────────────────────────
 
 const AI_FEATURES = [
-  { icon: Eye, label: "Court Detection", desc: "Automatic court boundary mapping and homography", ready: false },
-  { icon: Activity, label: "Player Tracking", desc: "Real-time player position tracking per frame", ready: false },
-  { icon: Zap, label: "Ball Tracking", desc: "Ball trajectory analysis at 120fps", ready: false },
-  { icon: Target, label: "Smart Scoring", desc: "Automatic point detection and scoring", ready: false },
-  { icon: Flame, label: "Event Detection", desc: "Bounce, net, out, winner detection", ready: false },
-  { icon: BarChart3, label: "Match Analysis", desc: "Full match statistics and breakdowns", ready: false },
-  { icon: MapPin, label: "Player Heatmap", desc: "Spatial movement and coverage analysis", ready: false },
-  { icon: TrendingUp, label: "Performance AI", desc: "AI-powered player progression analysis", ready: false },
+  { icon: Eye,        label: "Court Detection",   desc: "Automatic court boundary mapping and homography",    ready: false },
+  { icon: Activity,   label: "Player Tracking",   desc: "Real-time player position tracking per frame",       ready: false },
+  { icon: Zap,        label: "Ball Tracking",     desc: "Ball trajectory analysis at 120fps",                 ready: false },
+  { icon: Target,     label: "Smart Scoring",     desc: "Automatic point detection and scoring",              ready: false },
+  { icon: Flame,      label: "Event Detection",   desc: "Bounce, net, out, winner detection",                 ready: false },
+  { icon: BarChart3,  label: "Match Analysis",    desc: "Full match statistics and breakdowns",               ready: false },
+  { icon: MapPin,     label: "Player Heatmap",    desc: "Spatial movement and coverage analysis",             ready: false },
+  { icon: TrendingUp, label: "Performance AI",    desc: "AI-powered player progression analysis",             ready: false },
 ];
 
-// ── Heatmap Placeholder ────────────────────────────────────────────────────────
+// ── Access Denied ─────────────────────────────────────────────────────────────
 
-function HeatmapPlaceholder() {
+function AccessDenied() {
   return (
-    <div className="relative rounded-xl overflow-hidden border border-purple-500/20 bg-black/30 aspect-[4/3] sm:aspect-video flex items-center justify-center">
-      {/* Court outline */}
-      <svg className="absolute inset-0 w-full h-full opacity-20" viewBox="0 0 400 250" preserveAspectRatio="none">
-        <rect x="20" y="20" width="360" height="210" fill="none" stroke="hsl(var(--primary))" strokeWidth="1.5" />
-        <line x1="200" y1="20" x2="200" y2="230" stroke="hsl(var(--primary))" strokeWidth="1" />
-        <rect x="100" y="80" width="200" height="90" fill="none" stroke="hsl(var(--primary))" strokeWidth="1" strokeDasharray="4 3" />
-        <circle cx="200" cy="125" r="25" fill="none" stroke="hsl(var(--primary))" strokeWidth="1" />
-      </svg>
-      {/* Blurry heatmap blobs (decorative) */}
-      <div className="absolute top-[30%] left-[20%] w-16 h-16 rounded-full bg-purple-500/20 blur-xl" />
-      <div className="absolute top-[50%] right-[25%] w-12 h-12 rounded-full bg-blue-500/20 blur-xl" />
-      <div className="absolute bottom-[25%] left-[40%] w-10 h-10 rounded-full bg-primary/10 blur-lg" />
-      <div className="z-10 text-center p-4">
-        <MapPin size={28} className="text-purple-400/60 mx-auto mb-2" />
-        <p className="text-xs font-bold text-purple-300/60 uppercase tracking-widest">Heatmap</p>
-        <p className="text-[10px] text-muted-foreground mt-1">AI data pending</p>
+    <Layout>
+      <div className="container py-24 flex flex-col items-center text-center gap-4">
+        <AlertCircle size={40} className="text-destructive" />
+        <h1 className="text-2xl font-bold">Access Denied</h1>
+        <p className="text-muted-foreground text-sm">This page is for arena administrators only.</p>
       </div>
-    </div>
+    </Layout>
   );
 }
 
-// ── Main Page ─────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 const SmartPlayAI = () => {
   const user = getSessionUser();
+
+  if (!user || !["admin", "super_admin"].includes(user.role)) {
+    return <AccessDenied />;
+  }
+
   const [aiStatus, setAiStatus] = useState<SmartPlayStatus | null>(null);
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [legacyAnalyses, setLegacyAnalyses] = useState<AiAnalysis[]>([]);
-  const [metrics, setMetrics] = useState<AiMetrics | null>(null);
   const [loading, setLoading] = useState(true);
-  const [creatingJob, setCreatingJob] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const loadData = async () => {
-    if (!user) { setLoading(false); return; }
-    setLoading(true);
+  const loadData = async (silent = false) => {
+    if (silent) setRefreshing(true); else setLoading(true);
     try {
       const [statusRes, jobsRes, legacyRes] = await Promise.allSettled([
         api<SmartPlayStatus>("/api/smartplay/status"),
         api<{ jobs: AnalysisJob[] }>("/api/smartplay/analysis-jobs", { authenticated: true }),
         api<{ analyses: AiAnalysis[] }>("/api/ai/analyses", { authenticated: true }),
       ]);
-
       if (statusRes.status === "fulfilled") setAiStatus(statusRes.value);
-      if (jobsRes.status === "fulfilled") setJobs(jobsRes.value.jobs);
-      if (legacyRes.status === "fulfilled") setLegacyAnalyses(legacyRes.value.analyses);
-
-      // Load AI metrics for the current player
-      if (user.role === "player") {
-        try {
-          const metricsRes = await api<AiMetrics>(`/api/smartplay/player/${user.id}/analysis`, { authenticated: true });
-          setMetrics(metricsRes);
-        } catch { /* not critical */ }
-      }
+      if (jobsRes.status === "fulfilled") setJobs(jobsRes.value.jobs ?? []);
+      if (legacyRes.status === "fulfilled") setLegacyAnalyses(legacyRes.value.analyses ?? []);
     } catch { /* handled individually */ } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
-  useEffect(() => { void loadData(); }, [user?.id]);
+  useEffect(() => { void loadData(); }, []);
 
-  const requestAnalysis = async () => {
-    setCreatingJob(true);
-    try {
-      await api("/api/smartplay/analysis-jobs", {
-        method: "POST",
-        body: JSON.stringify({ userId: user?.id, jobType: "full_match" }),
-        authenticated: true,
-      });
-      toast.success("Analysis job queued. You'll be notified when it's ready.");
-      void loadData();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Failed to create analysis job.");
-    } finally {
-      setCreatingJob(false);
-    }
-  };
+  const queued     = jobs.filter((j) => j.status === "queued").length;
+  const processing = jobs.filter((j) => ["processing", "pending_ai"].includes(j.status)).length;
+  const completed  = jobs.filter((j) => ["completed", "ready"].includes(j.status)).length;
+  const failed     = jobs.filter((j) => j.status === "failed").length;
 
   return (
     <Layout>
@@ -181,33 +139,32 @@ const SmartPlayAI = () => {
 
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-3 mb-2">
-              <div className="p-2.5 rounded-xl bg-purple-500/10 border border-purple-500/20">
-                <Brain size={24} className="text-purple-400" />
-              </div>
-              <div>
-                <h1 className="text-3xl md:text-4xl font-display font-bold uppercase tracking-tighter">
-                  SmartPlay <span className="text-gradient">AI</span>
-                </h1>
-                <p className="text-muted-foreground text-sm">Intelligent Player & Match Analysis Platform</p>
-              </div>
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-purple-500/10 border border-purple-500/20">
+              <Brain size={24} className="text-purple-400" />
+            </div>
+            <div>
+              <h1 className="text-3xl md:text-4xl font-display font-bold uppercase tracking-tighter">
+                SmartPlay <span className="text-gradient">AI</span>
+              </h1>
+              <p className="text-muted-foreground text-sm">AI analysis management — {user.arenaName ?? "your arena"}</p>
             </div>
           </div>
-          {user && (
-            <Button
-              onClick={requestAnalysis}
-              disabled={creatingJob}
-              className="flex items-center gap-2 shrink-0"
-              variant="outline"
-            >
-              <Plus size={14} />
-              {creatingJob ? "Requesting…" : "Request Analysis"}
-            </Button>
-          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void loadData(true)}
+            disabled={refreshing}
+            className="shrink-0"
+          >
+            {refreshing
+              ? <Loader2 size={14} className="animate-spin mr-2" />
+              : <RefreshCw size={14} className="mr-2" />}
+            Refresh
+          </Button>
         </div>
 
-        {/* AI Service Status Banner */}
+        {/* AI Service Status */}
         {loading ? (
           <Skeleton className="h-20 rounded-2xl" />
         ) : (
@@ -238,10 +195,83 @@ const SmartPlayAI = () => {
           </div>
         )}
 
-        {/* AI Feature Roadmap */}
-        <div className="space-y-4">
+        {/* Quick Stats */}
+        {!loading && (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {[
+              { label: "Queued",     value: queued,     cls: "text-amber-300",  bg: "bg-amber-500/10",  border: "border-amber-500/20" },
+              { label: "Processing", value: processing, cls: "text-blue-300",   bg: "bg-blue-500/10",   border: "border-blue-500/20" },
+              { label: "Completed",  value: completed,  cls: "text-green-300",  bg: "bg-green-500/10",  border: "border-green-500/20" },
+              { label: "Failed",     value: failed,     cls: "text-red-300",    bg: "bg-red-500/10",    border: "border-red-500/20" },
+            ].map(({ label, value, cls, bg, border }) => (
+              <div key={label} className={`gradient-card rounded-xl border ${border} p-4`}>
+                <p className={`text-2xl font-bold ${cls}`}>{value}</p>
+                <p className="text-xs text-muted-foreground mt-0.5 uppercase tracking-widest font-medium">{label}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Analysis Queue */}
+        <section className="space-y-4">
           <h2 className="text-lg font-display font-bold flex items-center gap-2">
-            <Cpu size={18} className="text-primary" /> SmartPlay AI Feature Roadmap
+            <Activity size={18} className="text-primary" /> Analysis Queue
+          </h2>
+
+          {loading ? (
+            <div className="space-y-3">
+              {[1, 2, 3].map((i) => <Skeleton key={i} className="h-14 rounded-xl" />)}
+            </div>
+          ) : jobs.length === 0 && legacyAnalyses.length === 0 ? (
+            <div className="gradient-card rounded-2xl border border-border/40 p-12 text-center">
+              <Brain size={36} className="text-muted-foreground/30 mx-auto mb-3" />
+              <p className="text-muted-foreground text-sm">No analysis jobs yet.</p>
+              <p className="text-xs text-muted-foreground/70 mt-1">Upload a match clip from the admin panel to start processing.</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {jobs.map((job) => (
+                <div key={`job-${job.id}`} className="gradient-card rounded-xl border border-border/40 p-4 flex items-center gap-4">
+                  <div className="p-2 rounded-xl bg-purple-500/10 flex-shrink-0">
+                    <Brain size={16} className="text-purple-400" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium capitalize">{job.job_type.replace(/_/g, " ")} Analysis</p>
+                    {job.player1_name && (
+                      <p className="text-xs text-muted-foreground">{job.player1_name}{job.player2_name ? ` vs ${job.player2_name}` : ""}</p>
+                    )}
+                  </div>
+                  <StatusBadge status={job.status} />
+                  <p className="text-xs text-muted-foreground flex-shrink-0 hidden sm:block">
+                    {new Date(job.created_at).toLocaleDateString()}
+                  </p>
+                </div>
+              ))}
+              {legacyAnalyses.map((analysis) => (
+                <div key={`legacy-${analysis.id}`} className="gradient-card rounded-xl border border-border/40 p-4 flex items-center gap-4">
+                  <div className="p-2 rounded-xl bg-primary/10 flex-shrink-0">
+                    <Activity size={16} className="text-primary" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{analysis.title}</p>
+                    {analysis.summary && (
+                      <p className="text-xs text-muted-foreground truncate">{analysis.summary}</p>
+                    )}
+                  </div>
+                  <StatusBadge status={analysis.status} />
+                  <p className="text-xs text-muted-foreground flex-shrink-0 hidden sm:block">
+                    {new Date(analysis.createdAt).toLocaleDateString()}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* AI Feature Roadmap */}
+        <section className="space-y-4">
+          <h2 className="text-lg font-display font-bold flex items-center gap-2">
+            <Cpu size={18} className="text-primary" /> Feature Roadmap
           </h2>
           <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
             {AI_FEATURES.map((feature) => (
@@ -260,133 +290,27 @@ const SmartPlayAI = () => {
               </div>
             ))}
           </div>
-        </div>
+        </section>
 
-        {/* Player Metrics (if logged in) */}
-        {user && (
-          <div className="grid lg:grid-cols-2 gap-6">
-            {/* AI Performance Metrics */}
-            <div className="gradient-card rounded-2xl border border-purple-500/20 p-6">
-              <h3 className="text-sm font-bold uppercase tracking-widest text-muted-foreground mb-5 flex items-center gap-2">
-                <BarChart3 size={14} /> Your AI Performance Metrics
-              </h3>
-              {metrics?.available ? (
-                <p className="text-sm text-green-300">AI metrics available — data will display here</p>
-              ) : (
-                <div className="space-y-3">
-                  {[
-                    { label: "Court Coverage", sub: "Percentage of court surface reached" },
-                    { label: "Reaction Speed", sub: "Average response time to incoming ball" },
-                    { label: "Shot Accuracy", sub: "Percentage of accurate placements" },
-                    { label: "Movement Score", sub: "Composite movement efficiency score" },
-                    { label: "Error Rate", sub: "Unforced errors per match" },
-                  ].map(({ label, sub }) => (
-                    <div key={label} className="flex items-center gap-3">
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium">{label}</p>
-                        <p className="text-[10px] text-muted-foreground">{sub}</p>
-                      </div>
-                      <div className="h-2 w-24 rounded-full bg-purple-500/10 border border-purple-500/10 overflow-hidden flex-shrink-0">
-                        <div className="h-full w-0 bg-purple-400/30 rounded-full" />
-                      </div>
-                      <span className="text-xs font-mono text-muted-foreground/50 w-8 text-right flex-shrink-0">—</span>
-                    </div>
-                  ))}
-                  <p className="text-[10px] text-muted-foreground/60 text-center pt-2 border-t border-border/20 mt-3">
-                    Metrics will populate once SmartPlay AI processes your matches
-                  </p>
-                </div>
-              )}
-            </div>
-
-            {/* Heatmap Placeholder */}
-            <div className="gradient-card rounded-2xl border border-purple-500/20 p-6">
-              <h3 className="text-sm font-bold uppercase tracking-widest text-muted-foreground mb-4 flex items-center gap-2">
-                <Flame size={14} /> Movement Heatmap
-              </h3>
-              <HeatmapPlaceholder />
-            </div>
-          </div>
-        )}
-
-        {/* Analysis Jobs */}
-        {user && (
-          <div className="space-y-4">
-            <h2 className="text-lg font-display font-bold flex items-center gap-2">
-              <Activity size={18} className="text-primary" /> Analysis Queue
-            </h2>
-
-            {loading ? (
-              <div className="space-y-3">{Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-14 rounded-xl" />)}</div>
-            ) : jobs.length === 0 && legacyAnalyses.length === 0 ? (
-              <div className="gradient-card rounded-2xl border border-border/40 p-12 text-center">
-                <Brain size={36} className="text-muted-foreground/30 mx-auto mb-3" />
-                <p className="text-muted-foreground text-sm">No analysis jobs yet.</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">Request an analysis to see it here.</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {/* New smartplay jobs */}
-                {jobs.map((job) => (
-                  <div key={`job-${job.id}`} className="gradient-card rounded-xl border border-border/40 p-4 flex items-center gap-4">
-                    <div className="p-2 rounded-xl bg-purple-500/10 flex-shrink-0">
-                      <Brain size={16} className="text-purple-400" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium capitalize">{job.job_type.replace(/_/g, " ")} Analysis</p>
-                      {job.player1_name && (
-                        <p className="text-xs text-muted-foreground">{job.player1_name} vs {job.player2_name}</p>
-                      )}
-                    </div>
-                    <StatusBadge status={job.status} />
-                    <p className="text-xs text-muted-foreground flex-shrink-0">
-                      {new Date(job.created_at).toLocaleDateString()}
-                    </p>
-                  </div>
-                ))}
-                {/* Legacy ai_analyses */}
-                {legacyAnalyses.map((analysis) => (
-                  <div key={`legacy-${analysis.id}`} className="gradient-card rounded-xl border border-border/40 p-4 flex items-center gap-4">
-                    <div className="p-2 rounded-xl bg-primary/10 flex-shrink-0">
-                      <Activity size={16} className="text-primary" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium truncate">{analysis.title}</p>
-                      {analysis.summary && (
-                        <p className="text-xs text-muted-foreground truncate">{analysis.summary}</p>
-                      )}
-                    </div>
-                    <StatusBadge status={analysis.status} />
-                    <p className="text-xs text-muted-foreground flex-shrink-0">
-                      {new Date(analysis.createdAt).toLocaleDateString()}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Future Integration Note */}
+        {/* Integration Note */}
         <div className="gradient-card rounded-2xl border border-purple-500/20 p-6 bg-purple-500/3">
           <div className="flex items-start gap-4">
             <div className="p-2.5 rounded-xl bg-purple-500/10 flex-shrink-0">
               <Radio size={18} className="text-purple-400" />
             </div>
             <div>
-              <h3 className="font-bold text-sm mb-2">About SmartPlay AI Integration</h3>
+              <h3 className="font-bold text-sm mb-2">SmartPlay AI Pipeline</h3>
               <p className="text-xs text-muted-foreground leading-relaxed mb-3">
-                SmartPlay AI is ULTIMA's upcoming intelligent analysis engine. Once connected, it will automatically process
-                match footage to deliver:
+                Upload match clips from the <strong>Admin → Analysis</strong> tab to trigger the full AI pipeline.
+                Once processed, results are automatically shared with the players in the match.
               </p>
               <ul className="text-xs text-muted-foreground space-y-1">
                 {[
-                  "Real-time ball and player tracking at 120fps",
-                  "Automatic rally length, winner, and error detection",
-                  "Player movement heatmaps and court coverage scores",
-                  "Shot placement and speed analytics",
-                  "Match-by-match performance progression",
-                  "Personalized training recommendations",
+                  "Court calibration loaded from your court configuration",
+                  "Homography applied automatically per court",
+                  "Player and ball tracking processed at 120fps",
+                  "Minimap, heatmap, and pose estimation rendered",
+                  "Results available to players in their Performance page",
                 ].map((item) => (
                   <li key={item} className="flex items-center gap-2">
                     <ChevronRight size={10} className="text-purple-400 flex-shrink-0" />
