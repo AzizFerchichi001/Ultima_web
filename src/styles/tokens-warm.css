@@ -1,0 +1,82 @@
+/**
+ * Warm off-white design system tokens — NOT IMPORTED YET.
+ *
+ * This file is prepared but intentionally not imported anywhere.
+ * Switch themes by replacing the :root block in src/index.css with this one,
+ * or add `@import './styles/tokens-warm.css';` to src/index.css.
+ *
+ * Target: Inter or Geist, weights 400/500/600.
+ * Background: #FAF9F6 warm off-white.
+ * Accent: single primary action color, no gradients.
+ */
+
+:root {
+  /* ── Type ─────────────────────────────────────────────────── */
+  --font-sans: "Inter", "Geist", system-ui, sans-serif;
+
+  /* ── Color ────────────────────────────────────────────────── */
+  --background:   0 0% 98%;            /* #FAF9F6 ≈ warm off-white */
+  --foreground:   220 15% 16%;         /* near-black warm */
+
+  --card:         0 0% 100%;           /* pure white for card surfaces */
+  --card-foreground: 220 15% 16%;
+
+  --popover:      0 0% 100%;
+  --popover-foreground: 220 15% 16%;
+
+  --primary:      213 90% 40%;         /* single accent — deep blue */
+  --primary-foreground: 0 0% 100%;
+
+  --secondary:    220 10% 94%;
+  --secondary-foreground: 220 15% 28%;
+
+  --muted:        220 10% 94%;
+  --muted-foreground: 220 8% 52%;
+
+  --accent:       213 90% 40%;
+  --accent-foreground: 0 0% 100%;
+
+  --destructive:  0 72% 51%;           /* true errors only */
+  --destructive-foreground: 0 0% 100%;
+
+  --warning:      38 92% 50%;          /* amber — warnings */
+  --warning-foreground: 38 92% 15%;
+
+  --success:      142 69% 40%;         /* green — confirmation states */
+  --success-foreground: 0 0% 100%;
+
+  --border:       220 10% 88%;         /* #E8E6E1 soft gray */
+  --input:        220 10% 88%;
+  --ring:         213 90% 40%;
+
+  /* ── Spacing scale ────────────────────────────────────────── */
+  --space-content: 28px;   /* padding around content blocks */
+  --space-card:    24px;   /* internal card padding */
+
+  /* ── Radius ───────────────────────────────────────────────── */
+  --radius: 0.625rem;       /* 10px — quieter than current 12px */
+
+  /* ── Sidebar (unchanged structure) ───────────────────────── */
+  --sidebar-background: 0 0% 100%;
+  --sidebar-foreground: 220 15% 16%;
+  --sidebar-primary: 213 90% 40%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 220 10% 94%;
+  --sidebar-accent-foreground: 220 15% 28%;
+  --sidebar-border: 220 10% 88%;
+  --sidebar-ring: 213 90% 40%;
+}
+
+/* Dark variant of the warm system (optional) */
+.dark {
+  --background:   220 20% 10%;
+  --foreground:   220 10% 92%;
+  --card:         220 18% 14%;
+  --card-foreground: 220 10% 92%;
+  --primary:      213 90% 60%;
+  --primary-foreground: 220 20% 10%;
+  --muted:        220 15% 18%;
+  --muted-foreground: 220 8% 55%;
+  --border:       220 12% 22%;
+  --input:        220 12% 22%;
+}

@@ -1,0 +1,16 @@
+{
+  "name": "ULTIMA Smart Scoring",
+  "short_name": "ULTIMA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08111f",
+  "theme_color": "#00e5ff",
+  "description": "ULTIMA platform for reservations, competitions, smart scoring, and player analysis.",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "48x48 32x32 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,522 @@ const BILLING_SECRET = process.env.BILLING_SIGNATURE_SECRET ?? process.env.JWT_S
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const LOGO_CANDIDATE_PATHS = [path.resolve(__dirname, "../src/assets/ultima_logo.jpg"), path.resolve(__dirname, "../public/ultima_logo.jpg")];
+const DB_STARTUP_RETRY_ATTEMPTS = Number(process.env.DB_STARTUP_RETRY_ATTEMPTS ?? 240);
+const DB_STARTUP_RETRY_DELAY_MS = Number(process.env.DB_STARTUP_RETRY_DELAY_MS ?? 1000);
+const mkCourt = (name, opts = {}) => ({
+  name,
+  sport: "Padel",
+  status: "available",
+  has_summa: opts.has_summa ?? false,
+  location: opts.location ?? name,
+  min_players: 2,
+  max_players: 4,
+  opening_time: opts.opening_time ?? "08:00",
+  closing_time: opts.closing_time ?? "22:00",
+  court_type: opts.court_type ?? "indoor",
+  surface_type: opts.surface_type ?? "Gazon artificiel padel",
+  has_lighting: opts.has_lighting ?? true,
+  is_panoramic: opts.is_panoramic ?? false,
+  price_per_hour: opts.price_per_hour ?? null,
+  currency: "TND",
+  image_url: opts.image_url ?? null,
+  description: opts.description ?? null,
+});
+
+const PADEL_PLACES = [
+  {
+    name: "Arena Padel Premium",
+    slug: "arena-padel-premium",
+    location: "La Soukra, Ariana",
+    description: "Le complexe padel premium de référence à La Soukra. 5 courts professionnels indoor avec revêtement haut de gamme, éclairage LED et espace lounge.",
+    city: "La Soukra",
+    region: "Ariana",
+    address: "Rue du Parc, La Soukra, Ariana",
+    phone: null,
+    website: null,
+    instagram: null,
+    facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–00:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Cafétéria", "Pro Shop", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1554068865-24cecd4e34b8?w=800&q=80&auto=format&fit=crop",
+    gallery_images: ["https://picsum.photos/seed/arena-soukra-g1/800/500", "https://picsum.photos/seed/arena-soukra-g2/800/500"],
+    has_padel: true,
+    courts: [
+      mkCourt("Arena Court 1", { location: "Arena Padel Premium", opening_time: "08:00", closing_time: "23:00", price_per_hour: 50, image_url: "https://picsum.photos/seed/arena-c1/600/400" }),
+      mkCourt("Arena Court 2", { location: "Arena Padel Premium", opening_time: "08:00", closing_time: "23:00", price_per_hour: 50, image_url: "https://picsum.photos/seed/arena-c2/600/400" }),
+      mkCourt("Arena Court 3", { location: "Arena Padel Premium", opening_time: "08:00", closing_time: "23:00", price_per_hour: 50, image_url: "https://picsum.photos/seed/arena-c3/600/400" }),
+      mkCourt("Arena Court 4 Panoramic", { location: "Arena Padel Premium", opening_time: "08:00", closing_time: "23:00", price_per_hour: 60, is_panoramic: true, image_url: "https://picsum.photos/seed/arena-c4/600/400" }),
+      mkCourt("Arena Court 5 SUMMA", { location: "Arena Padel Premium", opening_time: "08:00", closing_time: "23:00", price_per_hour: 70, is_panoramic: true, has_summa: true, image_url: "https://picsum.photos/seed/arena-c5/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Indoor La Soukra",
+    slug: "padel-indoor-la-soukra",
+    location: "La Soukra, Ariana",
+    description: "Club padel indoor au cœur de La Soukra. Courts professionnels avec ambiance chaleureuse et encadrement de qualité.",
+    city: "La Soukra",
+    region: "Ariana",
+    address: "V6CJ+P4H, La Soukra",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Soukra Court 1", { location: "Padel Indoor La Soukra", price_per_hour: 45, image_url: "https://picsum.photos/seed/soukra-indoor-c1/600/400" }),
+      mkCourt("Soukra Court 2", { location: "Padel Indoor La Soukra", price_per_hour: 45, image_url: "https://picsum.photos/seed/soukra-indoor-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Marsa",
+    slug: "padel-marsa",
+    location: "La Marsa, Tunis",
+    description: "Club padel indoor situé dans la zone du Tennis Club ASM à La Marsa. Cadre de qualité avec vue sur la côte nord de Tunis.",
+    city: "La Marsa",
+    region: "Tunis",
+    address: "Tennis Club ASM, La Marsa, Tunis",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Bar"],
+    hero_image_url: "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Marsa Court 1", { location: "Padel Marsa", price_per_hour: 50, image_url: "https://picsum.photos/seed/marsa-c1/600/400" }),
+      mkCourt("Marsa Court 2", { location: "Padel Marsa", price_per_hour: 50, image_url: "https://picsum.photos/seed/marsa-c2/600/400" }),
+      mkCourt("Marsa Court 3", { location: "Padel Marsa", price_per_hour: 50, image_url: "https://picsum.photos/seed/marsa-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Padel House Tunisia",
+    slug: "padel-house-ariana",
+    location: "Sidi Amor, Ariana",
+    description: "L'un des premiers clubs padel indoor à Ariana. Ambiance conviviale, courts de qualité et espace lounge.",
+    city: "Ariana",
+    region: "Ariana",
+    address: "676 Sidi Amor, Avenue Jaafer, Ariana",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Cafétéria", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("House Court 1", { location: "Padel House Tunisia", price_per_hour: 48, image_url: "https://picsum.photos/seed/house-c1/600/400" }),
+      mkCourt("House Court 2", { location: "Padel House Tunisia", price_per_hour: 48, image_url: "https://picsum.photos/seed/house-c2/600/400" }),
+      mkCourt("House Court 3 SUMMA", { location: "Padel House Tunisia", price_per_hour: 55, is_panoramic: true, has_summa: true, image_url: "https://picsum.photos/seed/house-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Olympysky Club",
+    slug: "olympysky-club",
+    location: "Berges du Lac 2, Tunis",
+    description: "Club multi-sports aux Berges du Lac 2. 3 courts padel indoor avec grande salle de fitness et piscine.",
+    city: "Tunis",
+    region: "Tunis",
+    address: "Berges du Lac 2, Tunis",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "07:00–23:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Salle de sport", "Piscine", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1592659762303-90081d34b277?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Sky Court 1", { location: "Olympysky Club", opening_time: "07:00", closing_time: "23:00", price_per_hour: 55, image_url: "https://picsum.photos/seed/olymp-c1/600/400" }),
+      mkCourt("Sky Court 2 SUMMA", { location: "Olympysky Club", opening_time: "07:00", closing_time: "23:00", price_per_hour: 65, is_panoramic: true, has_summa: true, image_url: "https://picsum.photos/seed/olymp-c2/600/400" }),
+      mkCourt("Sky Court 3", { location: "Olympysky Club", opening_time: "07:00", closing_time: "23:00", price_per_hour: 55, image_url: "https://picsum.photos/seed/olymp-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Connection",
+    slug: "padel-connection",
+    location: "Borj Louzir, Ariana",
+    description: "Club padel moderne à Borj Louzir. Courts indoor de qualité professionnelle avec encadrement de haut niveau.",
+    city: "Borj Louzir",
+    region: "Ariana",
+    address: "Borj Louzir, Ariana",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1580674684081-7617fbf3d745?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Connection Court 1", { location: "Padel Connection", price_per_hour: 45, image_url: "https://picsum.photos/seed/conn-c1/600/400" }),
+      mkCourt("Connection Court 2", { location: "Padel Connection", price_per_hour: 45, image_url: "https://picsum.photos/seed/conn-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Tennis Club de Tunis",
+    slug: "tennis-club-de-tunis",
+    location: "Belvédère, Tunis",
+    description: "Le plus ancien club de tennis de Tunisie, avec 2 courts padel dans son enceinte historique au Belvédère.",
+    city: "Tunis",
+    region: "Tunis",
+    address: "Parc du Belvédère, Tunis",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "07:00–22:00", sat_sun: "08:00–20:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Restaurant", "Pro Shop"],
+    hero_image_url: "https://images.unsplash.com/photo-1529900748604-07564a03e7a6?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Padel Court A", { location: "Tennis Club de Tunis", court_type: "outdoor", opening_time: "07:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/tct-c1/600/400" }),
+      mkCourt("Padel Court B", { location: "Tennis Club de Tunis", court_type: "outdoor", opening_time: "07:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/tct-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Megrine",
+    slug: "padel-megrine",
+    location: "Mégrine, Ben Arous",
+    description: "Club padel moderne à Mégrine. Destination sportive accessible depuis Tunis et Ben Arous.",
+    city: "Mégrine",
+    region: "Ben Arous",
+    address: "Mégrine, Ben Arous",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1484516994939-f50b1f456e39?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Megrine Court 1", { location: "Padel Megrine", price_per_hour: 40, image_url: "https://picsum.photos/seed/meg-c1/600/400" }),
+      mkCourt("Megrine Court 2", { location: "Padel Megrine", price_per_hour: 40, image_url: "https://picsum.photos/seed/meg-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Sassi Padel",
+    slug: "sassi-padel",
+    location: "Sidi Hssine, Tunis",
+    description: "Club padel situé à Sidi Hssine. Courts bien entretenus et ambiance sportive locale.",
+    city: "Sidi Hssine",
+    region: "Tunis",
+    address: "Sidi Hssine, Tunis",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires"],
+    hero_image_url: "https://images.unsplash.com/photo-1554068865-24cecd4e34b8?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Sassi Court 1", { location: "Sassi Padel", price_per_hour: 38, image_url: "https://picsum.photos/seed/sassi-c1/600/400" }),
+      mkCourt("Sassi Court 2", { location: "Sassi Padel", price_per_hour: 38, image_url: "https://picsum.photos/seed/sassi-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Yalla Padel Sousse",
+    slug: "yalla-padel-sousse",
+    location: "Sousse",
+    description: "Complexe padel moderne à Sousse, près du Jaz Tour Khalef. 3 courts indoor avec équipements de compétition.",
+    city: "Sousse",
+    region: "Sousse",
+    address: "Zone hôtelière, Sousse",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Cafétéria", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Yalla Court 1", { location: "Yalla Padel Sousse", opening_time: "08:00", closing_time: "23:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/yalla-c1/600/400" }),
+      mkCourt("Yalla Court 2", { location: "Yalla Padel Sousse", opening_time: "08:00", closing_time: "23:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/yalla-c2/600/400" }),
+      mkCourt("Yalla Court 3 Panoramic", { location: "Yalla Padel Sousse", opening_time: "08:00", closing_time: "23:00", price_per_hour: 55, is_panoramic: true, image_url: "https://picsum.photos/seed/yalla-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Padelium Marhaba",
+    slug: "padelium-marhaba",
+    location: "Sousse Marhaba",
+    description: "Club padel adossé à l'Occidental Sousse Marhaba. Infrastructure de qualité hôtelière, accès courts pour résidents et public.",
+    city: "Sousse",
+    region: "Sousse",
+    address: "Occidental Sousse Marhaba, Sousse",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Piscine hôtel", "Restaurant"],
+    hero_image_url: "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Marhaba Court 1", { location: "Padelium Marhaba", court_type: "outdoor", price_per_hour: 50, image_url: "https://picsum.photos/seed/marh-c1/600/400" }),
+      mkCourt("Marhaba Court 2", { location: "Padelium Marhaba", court_type: "outdoor", price_per_hour: 50, image_url: "https://picsum.photos/seed/marh-c2/600/400" }),
+      mkCourt("Marhaba Court 3 Indoor", { location: "Padelium Marhaba", price_per_hour: 55, image_url: "https://picsum.photos/seed/marh-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Stars Padel Club",
+    slug: "stars-padel-club",
+    location: "Akouda, Sousse",
+    description: "Club padel à Akouda, entre Sousse et Monastir. 3 courts outdoor éclairés pour jouer le soir en bord de mer.",
+    city: "Akouda",
+    region: "Sousse",
+    address: "Akouda, Sousse",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "09:00–23:00", sat_sun: "09:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Bar"],
+    hero_image_url: "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Stars Court 1", { location: "Stars Padel Club", court_type: "outdoor", opening_time: "09:00", closing_time: "23:00", price_per_hour: 40, image_url: "https://picsum.photos/seed/stars-c1/600/400" }),
+      mkCourt("Stars Court 2", { location: "Stars Padel Club", court_type: "outdoor", opening_time: "09:00", closing_time: "23:00", price_per_hour: 40, image_url: "https://picsum.photos/seed/stars-c2/600/400" }),
+      mkCourt("Stars Court 3", { location: "Stars Padel Club", court_type: "outdoor", opening_time: "09:00", closing_time: "23:00", price_per_hour: 40, image_url: "https://picsum.photos/seed/stars-c3/600/400" }),
+    ],
+  },
+  {
+    name: "One Padel Monastir",
+    slug: "one-padel-monastir",
+    location: "Monastir",
+    description: "Club padel moderne à Monastir. Courts indoor et outdoor de qualité professionnelle, tous niveaux bienvenus.",
+    city: "Monastir",
+    region: "Monastir",
+    address: "Monastir",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1592659762303-90081d34b277?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Monastir Court 1", { location: "One Padel Monastir", opening_time: "08:00", closing_time: "23:00", price_per_hour: 42, image_url: "https://picsum.photos/seed/opm-c1/600/400" }),
+      mkCourt("Monastir Court 2", { location: "One Padel Monastir", opening_time: "08:00", closing_time: "23:00", price_per_hour: 42, image_url: "https://picsum.photos/seed/opm-c2/600/400" }),
+      mkCourt("Monastir Court 3 Outdoor", { location: "One Padel Monastir", court_type: "outdoor", opening_time: "08:00", closing_time: "23:00", price_per_hour: 38, image_url: "https://picsum.photos/seed/opm-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Club Rivage Monastir",
+    slug: "padel-club-rivage-monastir",
+    location: "Monastir",
+    description: "Club padel en bord de mer à Monastir. Vue sur la Méditerranée depuis les courts outdoor, ambiance unique.",
+    city: "Monastir",
+    region: "Monastir",
+    address: "Monastir, bord de mer",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Bar", "Vue mer"],
+    hero_image_url: "https://images.unsplash.com/photo-1580674684081-7617fbf3d745?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Rivage Court 1", { location: "Padel Club Rivage Monastir", court_type: "outdoor", price_per_hour: 40, image_url: "https://picsum.photos/seed/rivage-c1/600/400" }),
+      mkCourt("Rivage Court 2", { location: "Padel Club Rivage Monastir", court_type: "outdoor", price_per_hour: 40, image_url: "https://picsum.photos/seed/rivage-c2/600/400" }),
+    ],
+  },
+  {
+    name: "O Padel Nabeul",
+    slug: "o-padel-nabeul",
+    location: "Nabeul",
+    description: "O Padel Nabeul propose des courts panoramiques en verre de haute qualité dans la ville de Nabeul. Expérience immersive unique.",
+    city: "Nabeul",
+    region: "Nabeul",
+    address: "Nabeul, Cap Bon",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Cafétéria"],
+    hero_image_url: "https://images.unsplash.com/photo-1484516994939-f50b1f456e39?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Panoramic Court 1", { location: "O Padel Nabeul", opening_time: "08:00", closing_time: "23:00", price_per_hour: 55, is_panoramic: true, image_url: "https://picsum.photos/seed/opn-c1/600/400" }),
+      mkCourt("Panoramic Court 2", { location: "O Padel Nabeul", opening_time: "08:00", closing_time: "23:00", price_per_hour: 55, is_panoramic: true, image_url: "https://picsum.photos/seed/opn-c2/600/400" }),
+    ],
+  },
+  {
+    name: "One Padel Hammamet",
+    slug: "one-padel-hammamet",
+    location: "Hammamet",
+    description: "Club padel moderne à Hammamet, proche de la zone touristique. 3 courts de qualité pour tous niveaux.",
+    city: "Hammamet",
+    region: "Nabeul",
+    address: "Zone touristique, Hammamet",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–00:00" },
+    amenities: ["Parking", "Vestiaires", "Cafétéria", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1529900748604-07564a03e7a6?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Hammamet One Court 1", { location: "One Padel Hammamet", court_type: "outdoor", opening_time: "08:00", closing_time: "23:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/oph-c1/600/400" }),
+      mkCourt("Hammamet One Court 2", { location: "One Padel Hammamet", court_type: "outdoor", opening_time: "08:00", closing_time: "23:00", price_per_hour: 45, image_url: "https://picsum.photos/seed/oph-c2/600/400" }),
+      mkCourt("Hammamet One Court 3 Indoor", { location: "One Padel Hammamet", opening_time: "08:00", closing_time: "23:00", price_per_hour: 50, image_url: "https://picsum.photos/seed/oph-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Hammamet",
+    slug: "padel-hammamet",
+    location: "Hammamet",
+    description: "Club padel outdoor bien établi à Hammamet. Courts avec vue agréable, idéaux pour jouer en après-midi ou en soirée.",
+    city: "Hammamet",
+    region: "Nabeul",
+    address: "Hammamet",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires"],
+    hero_image_url: "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Hammamet Court 1", { location: "Padel Hammamet", court_type: "outdoor", price_per_hour: 40, image_url: "https://picsum.photos/seed/ph-c1/600/400" }),
+      mkCourt("Hammamet Court 2", { location: "Padel Hammamet", court_type: "outdoor", price_per_hour: 40, image_url: "https://picsum.photos/seed/ph-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Casa del Padel Sfax",
+    slug: "casa-del-padel-sfax",
+    location: "Sfax",
+    description: "Le club de référence à Sfax sur la route Sidi Mansour km 6. 3 courts indoor professionnels avec infrastructure complète.",
+    city: "Sfax",
+    region: "Sfax",
+    address: "Route Sidi Mansour km 6, Sfax",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Douches", "Cafétéria", "WiFi"],
+    hero_image_url: "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Casa Sfax Court 1", { location: "Casa del Padel Sfax", opening_time: "08:00", closing_time: "23:00", price_per_hour: 40, image_url: "https://picsum.photos/seed/cdp-c1/600/400" }),
+      mkCourt("Casa Sfax Court 2", { location: "Casa del Padel Sfax", opening_time: "08:00", closing_time: "23:00", price_per_hour: 40, image_url: "https://picsum.photos/seed/cdp-c2/600/400" }),
+      mkCourt("Casa Sfax Court 3 Panoramic", { location: "Casa del Padel Sfax", opening_time: "08:00", closing_time: "23:00", price_per_hour: 50, is_panoramic: true, image_url: "https://picsum.photos/seed/cdp-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Vamos Sport Sfax",
+    slug: "vamos-sport-sfax",
+    location: "Sfax",
+    description: "Centre sportif Vamos Sport (Route Teniour, Sfax). Courts padel modernes dans un complexe multi-sport.",
+    city: "Sfax",
+    region: "Sfax",
+    address: "Route Teniour, Sfax",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "Salle de sport"],
+    hero_image_url: "https://images.unsplash.com/photo-1592659762303-90081d34b277?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Vamos Court 1", { location: "Vamos Sport Sfax", price_per_hour: 38, image_url: "https://picsum.photos/seed/vamos-c1/600/400" }),
+      mkCourt("Vamos Court 2", { location: "Vamos Sport Sfax", price_per_hour: 38, image_url: "https://picsum.photos/seed/vamos-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Le Padel Sfax",
+    slug: "le-padel-sfax",
+    location: "Sfax",
+    description: "Atlas World Padel Sfax, route de Gabès km 4. Courts de compétition avec encadrement professionnel.",
+    city: "Sfax",
+    region: "Sfax",
+    address: "Route de Gabès km 4, Sfax",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–23:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Pro Shop"],
+    hero_image_url: "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Atlas Sfax Court 1", { location: "Le Padel Sfax", opening_time: "08:00", closing_time: "23:00", price_per_hour: 42, image_url: "https://picsum.photos/seed/lps-c1/600/400" }),
+      mkCourt("Atlas Sfax Court 2", { location: "Le Padel Sfax", opening_time: "08:00", closing_time: "23:00", price_per_hour: 42, image_url: "https://picsum.photos/seed/lps-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Club Padel Djerba",
+    slug: "club-padel-djerba",
+    location: "Houmt Souk, Djerba",
+    description: "Club padel à Houmt Souk, centre de l'île de Djerba. Courts outdoor avec vue sur le paysage insulaire.",
+    city: "Houmt Souk",
+    region: "Médenine",
+    address: "Houmt Souk, Djerba",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires"],
+    hero_image_url: "https://images.unsplash.com/photo-1484516994939-f50b1f456e39?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Djerba Court 1", { location: "Club Padel Djerba", court_type: "outdoor", price_per_hour: 35, image_url: "https://picsum.photos/seed/djb-c1/600/400" }),
+      mkCourt("Djerba Court 2", { location: "Club Padel Djerba", court_type: "outdoor", price_per_hour: 35, image_url: "https://picsum.photos/seed/djb-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Padel Club Djerba Radisson",
+    slug: "padel-club-djerba-radisson",
+    location: "Djerba",
+    description: "Courts padel du Radisson Blu Palace Resort & Thalasso Djerba. Accès semi-public avec équipements hôteliers haut de gamme.",
+    city: "Djerba",
+    region: "Médenine",
+    address: "Radisson Blu Palace Resort & Thalasso, Djerba",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–20:00", sat_sun: "08:00–20:00" },
+    amenities: ["Parking", "Vestiaires", "Piscine hôtel", "Restaurant", "Spa"],
+    hero_image_url: "https://images.unsplash.com/photo-1580674684081-7617fbf3d745?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Radisson Court 1", { location: "Padel Club Djerba Radisson", court_type: "outdoor", closing_time: "20:00", price_per_hour: 55, image_url: "https://picsum.photos/seed/rad-c1/600/400" }),
+      mkCourt("Radisson Court 2", { location: "Padel Club Djerba Radisson", court_type: "outdoor", closing_time: "20:00", price_per_hour: 55, image_url: "https://picsum.photos/seed/rad-c2/600/400" }),
+      mkCourt("Radisson Court 3 Panoramic", { location: "Padel Club Djerba Radisson", court_type: "outdoor", closing_time: "20:00", price_per_hour: 65, is_panoramic: true, image_url: "https://picsum.photos/seed/rad-c3/600/400" }),
+    ],
+  },
+  {
+    name: "Bourgo Arena Djerba",
+    slug: "bourgo-arena-djerba",
+    location: "Djerba",
+    description: "Arena padel moderne à Djerba. Courts indoor avec infrastructure complète dans un cadre insulaire unique.",
+    city: "Djerba",
+    region: "Médenine",
+    address: "Djerba",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–22:00", sat_sun: "08:00–23:00" },
+    amenities: ["Parking", "Vestiaires", "Cafétéria"],
+    hero_image_url: "https://images.unsplash.com/photo-1554068865-24cecd4e34b8?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Bourgo Court 1", { location: "Bourgo Arena Djerba", price_per_hour: 38, image_url: "https://picsum.photos/seed/bourgo-c1/600/400" }),
+      mkCourt("Bourgo Court 2", { location: "Bourgo Arena Djerba", price_per_hour: 38, image_url: "https://picsum.photos/seed/bourgo-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Club Med Djerba",
+    slug: "club-med-djerba",
+    location: "Midoun, Djerba",
+    description: "Club padel du Club Med Djerba La Douce à Midoun. Accès privilégié pour les membres avec équipements all-inclusive.",
+    city: "Midoun",
+    region: "Médenine",
+    address: "Club Med Djerba La Douce, Midoun, Djerba",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "08:00–20:00", sat_sun: "08:00–20:00" },
+    amenities: ["Parking", "Vestiaires", "Piscine", "Restaurant", "Animation"],
+    hero_image_url: "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("ClubMed Court 1", { location: "Club Med Djerba", court_type: "outdoor", closing_time: "20:00", price_per_hour: 60, image_url: "https://picsum.photos/seed/clubmed-c1/600/400" }),
+      mkCourt("ClubMed Court 2", { location: "Club Med Djerba", court_type: "outdoor", closing_time: "20:00", price_per_hour: 60, image_url: "https://picsum.photos/seed/clubmed-c2/600/400" }),
+    ],
+  },
+  {
+    name: "Le Club de Gammarth",
+    slug: "le-club-de-gammarth",
+    location: "Cap Gammarth, Tunis",
+    description: "Club multi-sports à Cap Gammarth avec courts padel outdoor vue mer. Cadre exceptionnel sur la côte nord de Tunis.",
+    city: "Gammarth",
+    region: "Tunis",
+    address: "Zone touristique Cap Gammarth, Tunis",
+    phone: null, website: null, instagram: null, facebook: null,
+    opening_hours: { mon_fri: "07:00–22:00", sat_sun: "07:00–22:00" },
+    amenities: ["Parking", "Vestiaires", "Restaurant", "Piscine"],
+    hero_image_url: "https://images.unsplash.com/photo-1529900748604-07564a03e7a6?w=800&q=80&auto=format&fit=crop",
+    gallery_images: [],
+    has_padel: true,
+    courts: [
+      mkCourt("Gammarth Court 1", { location: "Le Club de Gammarth", court_type: "outdoor", opening_time: "07:00", price_per_hour: 48, image_url: "https://picsum.photos/seed/gamm-c1/600/400" }),
+      mkCourt("Gammarth Court 2", { location: "Le Club de Gammarth", court_type: "outdoor", opening_time: "07:00", price_per_hour: 48, image_url: "https://picsum.photos/seed/gamm-c2/600/400" }),
+      mkCourt("Gammarth Court 3 SUMMA", { location: "Le Club de Gammarth", court_type: "outdoor", opening_time: "07:00", price_per_hour: 60, has_summa: true, image_url: "https://picsum.photos/seed/gamm-c3/600/400" }),
+    ],
+  },
+];
 
 const toIso = (value) => {
   if (!value) return null;
@@ -40,6 +556,8 @@ const resolveRole = (user) => (user?.platform_role === "super_admin" ? "super_ad
 const resolveStatus = (user) => (user?.platform_role === "super_admin" ? user?.status ?? "inactive" : user?.membership_status ?? user?.status ?? "inactive");
 const isAdminLike = (actor) => actor?.effective_role === "admin" || actor?.effective_role === "super_admin";
 const isCoachLike = (actor) => ["coach", "admin", "super_admin"].includes(actor?.effective_role);
+const normalizeEmail = (email) => String(email ?? "").trim().toLowerCase();
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 const sanitizeCourt = (court) => ({ ...court, created_at: toIso(court.created_at) });
 const sanitizeLog = (log) => ({ ...log, created_at: toIso(log.created_at) });
@@ -47,6 +565,7 @@ const sanitizeCompetition = (competition) => ({ ...competition, created_at: toIs
 const sanitizeReservation = (reservation) => ({
   ...reservation,
   created_at: toIso(reservation.created_at),
+  cancelled_at: toIso(reservation.cancelled_at),
   reservation_date: String(reservation.reservation_date).slice(0, 10),
   start_time: String(reservation.start_time).slice(0, 8),
   end_time: String(reservation.end_time).slice(0, 8),
@@ -124,6 +643,30 @@ async function queryUsersBy(whereClause, params = [], client = pool) {
 async function findUserById(id, client = pool) {
   const users = await queryUsersBy("WHERE users.id = $1 ORDER BY arena_memberships.id ASC LIMIT 1", [id], client);
   return users[0] ?? null;
+}
+
+export async function getUserById(id) {
+  return findUserById(Number(id));
+}
+
+export async function updateUserProfile(userId, { firstName, lastName }) {
+  const fields = [];
+  const params = [];
+  const set = (col, val) => { fields.push(`${col} = $${params.length + 1}`); params.push(val); };
+  if (firstName !== undefined) {
+    const fn = String(firstName ?? "").trim();
+    if (!fn) throw new Error("First name cannot be empty");
+    set("first_name", fn);
+  }
+  if (lastName !== undefined) {
+    const ln = String(lastName ?? "").trim();
+    if (!ln) throw new Error("Last name cannot be empty");
+    set("last_name", ln);
+  }
+  if (!fields.length) return findUserById(Number(userId));
+  params.push(Number(userId));
+  await pool.query(`UPDATE users SET ${fields.join(", ")} WHERE id = $${params.length}`, params);
+  return findUserById(Number(userId));
 }
 
 async function requireActiveActor(userId, client = pool) {
@@ -227,8 +770,37 @@ async function hasReservationConflict(courtId, reservationDate, startTime, endTi
   return rows.length > 0;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isDatabaseStarting(error) {
+  return error?.code === "57P03" || error?.code === "ECONNREFUSED" || error?.code === "ETIMEDOUT" || error?.code === "ENOTFOUND";
+}
+
+async function waitForDatabaseReady() {
+  const attempts = Math.max(1, DB_STARTUP_RETRY_ATTEMPTS);
+  const delayMs = Math.max(0, DB_STARTUP_RETRY_DELAY_MS);
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await pool.query("SELECT 1");
+      if (attempt > 1) {
+        console.log(`PostgreSQL accepted connections after ${attempt} attempts.`);
+      }
+      return;
+    } catch (error) {
+      if (!isDatabaseStarting(error) || attempt === attempts) {
+        throw error;
+      }
+      console.warn(`PostgreSQL is not ready yet (${error.code ?? error.message}). Retrying in ${delayMs}ms (${attempt}/${attempts})...`);
+      await sleep(delayMs);
+    }
+  }
+}
+
 export async function initializeDatabase() {
-  await pool.query("SELECT 1");
+  await waitForDatabaseReady();
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS count
      FROM information_schema.tables
@@ -240,6 +812,9 @@ export async function initializeDatabase() {
 
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cin_number VARCHAR(32)");
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL");
+  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT false");
+  await pool.query("ALTER TABLE arena_memberships ADD COLUMN IF NOT EXISTS head_coach_flag BOOLEAN NOT NULL DEFAULT false");
+  await pool.query("ALTER TABLE arena_memberships ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ NULL");
   await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_cin_number ON users (cin_number) WHERE cin_number IS NOT NULL");
   await pool.query(
     `CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -266,6 +841,36 @@ export async function initializeDatabase() {
   await pool.query("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user ON email_verification_tokens(user_id)");
   await pool.query("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_expires ON email_verification_tokens(expires_at)");
   await pool.query(
+    `CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      token VARCHAR(256) NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at)");
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS notifications (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      title VARCHAR(191) NOT NULL,
+      body TEXT NOT NULL,
+      type VARCHAR(64) NOT NULL DEFAULT 'info',
+      link_url VARCHAR(255) NULL,
+      read_at TIMESTAMPTZ NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)");
+  await pool.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS uploader_user_id BIGINT NULL");
+  await pool.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS subject_user_id BIGINT NULL");
+  await pool.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS match_id BIGINT NULL");
+  await pool.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS storage_path VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ NULL");
+  await pool.query(
     `UPDATE users
      SET cin_number = LPAD(id::text, 8, '0')
      WHERE role IN ('player', 'coach')
@@ -277,6 +882,289 @@ export async function initializeDatabase() {
      WHERE email_verified_at IS NULL
        AND created_at < TIMESTAMPTZ '2026-04-12 00:00:00+00'`
   );
+  // Padel places extended fields
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS city VARCHAR(100)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS region VARCHAR(100)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS address TEXT");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS phone VARCHAR(50)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS email_contact VARCHAR(191)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS website VARCHAR(255)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS instagram VARCHAR(255)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS facebook VARCHAR(255)");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS opening_hours JSONB DEFAULT '{}'::jsonb");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS amenities JSONB DEFAULT '[]'::jsonb");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS hero_image_url TEXT");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS gallery_images JSONB DEFAULT '[]'::jsonb");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS has_padel BOOLEAN DEFAULT false");
+  await pool.query("ALTER TABLE arenas ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS court_type VARCHAR(32) DEFAULT 'indoor'");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS surface_type VARCHAR(64)");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS has_lighting BOOLEAN DEFAULT true");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS is_panoramic BOOLEAN DEFAULT false");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS price_per_hour NUMERIC(10,2)");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'TND'");
+  await pool.query("ALTER TABLE courts ADD COLUMN IF NOT EXISTS image_url TEXT");
+
+  // Competition extended fields
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS rules TEXT NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS prizes TEXT NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS end_date DATE NULL");
+  await pool.query("ALTER TABLE competitions ADD COLUMN IF NOT EXISTS registration_deadline DATE NULL");
+  await pool.query("ALTER TABLE competition_registrations ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()").catch(() => {});
+
+  // SmartPlay AI tables
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS smartplay_analysis_jobs (
+      id                    SERIAL PRIMARY KEY,
+      user_id               INT NOT NULL REFERENCES users(id),
+      match_id              INT NULL,
+      job_type              VARCHAR(64) NOT NULL DEFAULT 'full_match',
+      source_video_path     VARCHAR(512) NULL,
+      status                VARCHAR(32) NOT NULL DEFAULT 'queued',
+      requested_by_user_id  INT NULL REFERENCES users(id),
+      result_data           JSONB NULL,
+      error_message         TEXT NULL,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_smartplay_jobs_user ON smartplay_analysis_jobs (user_id, created_at DESC)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_analysis (
+      id            SERIAL PRIMARY KEY,
+      match_id      INT NOT NULL,
+      heatmap_data  JSONB NULL,
+      raw_analysis  JSONB NULL,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_analysis_jobs (
+      id                    SERIAL PRIMARY KEY,
+      match_id              INT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      external_match_key    TEXT NULL,
+      camera_id             TEXT NOT NULL DEFAULT 'camera_01',
+      requested_by_user_id  INT NULL REFERENCES users(id) ON DELETE SET NULL,
+      job_id                TEXT NOT NULL UNIQUE,
+      status                TEXT NOT NULL DEFAULT 'queued',
+      ai_service_url        TEXT NULL,
+      input_video_path      TEXT NULL,
+      ball_tracks_path      TEXT NULL,
+      player_tracks_path    TEXT NULL,
+      output_dir            TEXT NULL,
+      debug_video_path      TEXT NULL,
+      error_message         TEXT NULL,
+      started_at            TIMESTAMPTZ NULL,
+      finished_at           TIMESTAMPTZ NULL,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_analysis_jobs_external_match ON ai_analysis_jobs(external_match_key, camera_id, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_analysis_jobs_requested_by ON ai_analysis_jobs(requested_by_user_id, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_analysis_jobs_status ON ai_analysis_jobs(status)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_scoring_events (
+      id                 SERIAL PRIMARY KEY,
+      analysis_job_id    INT NULL REFERENCES ai_analysis_jobs(id) ON DELETE CASCADE,
+      match_id           INT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      external_match_key TEXT NULL,
+      camera_id          TEXT NOT NULL DEFAULT 'camera_01',
+      frame              INT NOT NULL,
+      time_sec           NUMERIC NULL,
+      event_type         TEXT NOT NULL,
+      winner_side        TEXT NULL,
+      confidence         NUMERIC NULL,
+      reason             TEXT NULL,
+      raw                JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_scoring_events_job ON ai_scoring_events(analysis_job_id, frame)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_scoring_events_external_match ON ai_scoring_events(external_match_key, camera_id, frame)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_performance_summaries (
+      id              SERIAL PRIMARY KEY,
+      analysis_job_id INT NULL REFERENCES ai_analysis_jobs(id) ON DELETE CASCADE,
+      match_id        INT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      player_user_id  INT NULL REFERENCES users(id) ON DELETE SET NULL,
+      summary         JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_performance_summaries_job ON ai_performance_summaries(analysis_job_id)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_performance_summaries_player ON ai_performance_summaries(player_user_id, created_at DESC)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_uploaded_clips (
+      id                   SERIAL PRIMARY KEY,
+      match_id             INT NULL REFERENCES matches(id) ON DELETE SET NULL,
+      external_match_key   TEXT NULL,
+      player_user_id       INT NULL REFERENCES users(id) ON DELETE SET NULL,
+      uploaded_by_user_id  INT NULL REFERENCES users(id) ON DELETE SET NULL,
+      camera_id            TEXT NOT NULL DEFAULT 'camera_01',
+      sport_type           TEXT NOT NULL DEFAULT 'padel',
+      original_filename    TEXT NOT NULL,
+      stored_video_path    TEXT NOT NULL,
+      duration_sec         NUMERIC NULL,
+      fps                  NUMERIC NULL,
+      frame_count          INT NULL,
+      width                INT NULL,
+      height               INT NULL,
+      status               TEXT NOT NULL DEFAULT 'awaiting_court_annotation',
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_uploaded_clips_match ON ai_uploaded_clips(match_id, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_uploaded_clips_external_match ON ai_uploaded_clips(external_match_key, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_uploaded_clips_player ON ai_uploaded_clips(player_user_id, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_uploaded_clips_status ON ai_uploaded_clips(status)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_clip_jobs (
+      id                  SERIAL PRIMARY KEY,
+      clip_id             INT NOT NULL REFERENCES ai_uploaded_clips(id) ON DELETE CASCADE,
+      external_job_id     TEXT NULL UNIQUE,
+      job_type            TEXT NOT NULL DEFAULT 'clip_full_pipeline',
+      status              TEXT NOT NULL DEFAULT 'uploaded',
+      current_step        TEXT NOT NULL DEFAULT 'upload',
+      ai_service_url      TEXT NULL,
+      input_video_path    TEXT NULL,
+      homography_path     TEXT NULL,
+      court_surfaces_path TEXT NULL,
+      ball_tracks_path    TEXT NULL,
+      player_tracks_path  TEXT NULL,
+      scoring_out_dir     TEXT NULL,
+      rendered_video_path TEXT NULL,
+      error_message       TEXT NULL,
+      started_at          TIMESTAMPTZ NULL,
+      finished_at         TIMESTAMPTZ NULL,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_clip_jobs_clip ON ai_clip_jobs(clip_id, created_at DESC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_clip_jobs_status ON ai_clip_jobs(status)");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_clip_events (
+      id          SERIAL PRIMARY KEY,
+      clip_id     INT NOT NULL REFERENCES ai_uploaded_clips(id) ON DELETE CASCADE,
+      job_id      INT NULL REFERENCES ai_clip_jobs(id) ON DELETE CASCADE,
+      frame       INT NOT NULL,
+      time_sec    NUMERIC NULL,
+      event_type  TEXT NOT NULL,
+      winner_side TEXT NULL,
+      confidence  NUMERIC NULL,
+      reason      TEXT NULL,
+      raw         JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_clip_events_clip ON ai_clip_events(clip_id, frame)");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_ai_clip_events_job ON ai_clip_events(job_id, frame)");
+
+  // Training sessions (old coach system)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS training_sessions (
+      id              SERIAL PRIMARY KEY,
+      arena_id        INT NOT NULL REFERENCES arenas(id),
+      coach_user_id   INT NOT NULL REFERENCES users(id),
+      reservation_id  INT NULL REFERENCES reservations(id),
+      session_type    VARCHAR(64) NOT NULL DEFAULT 'group',
+      title           VARCHAR(255) NOT NULL DEFAULT '',
+      focus_areas     TEXT NOT NULL DEFAULT '',
+      notes           TEXT NOT NULL DEFAULT '',
+      status          VARCHAR(32) NOT NULL DEFAULT 'scheduled',
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_training_sessions_coach ON training_sessions (coach_user_id)");
+
+  // Billing tables
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_plans (
+      id                   SERIAL PRIMARY KEY,
+      code                 VARCHAR(64) NOT NULL UNIQUE,
+      name                 VARCHAR(128) NOT NULL,
+      max_admins           INT NOT NULL DEFAULT 2,
+      max_coaches          INT NOT NULL DEFAULT 5,
+      max_players          INT NOT NULL DEFAULT 100,
+      features_json        JSONB NOT NULL DEFAULT '{}',
+      monthly_price_cents  INT NOT NULL DEFAULT 0,
+      yearly_price_cents   INT NOT NULL DEFAULT 0,
+      is_active            SMALLINT NOT NULL DEFAULT 1
+    )
+  `);
+  await pool.query(`
+    INSERT INTO billing_plans (code, name, max_admins, max_coaches, max_players, features_json, monthly_price_cents, yearly_price_cents)
+    VALUES
+      ('starter',      'Starter',      2,  3,  50,  '{"analytics":false,"ai":false}',    0,       0),
+      ('pro',          'Pro',          5,  10, 200, '{"analytics":true,"ai":false}',     4900,    49000),
+      ('elite',        'Elite',        10, 25, 999, '{"analytics":true,"ai":true}',      9900,    99000)
+    ON CONFLICT (code) DO NOTHING
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS arena_subscriptions (
+      id                          SERIAL PRIMARY KEY,
+      arena_id                    INT NOT NULL REFERENCES arenas(id),
+      plan_id                     INT NOT NULL REFERENCES billing_plans(id),
+      status                      VARCHAR(32) NOT NULL DEFAULT 'active',
+      provider                    VARCHAR(64) NOT NULL DEFAULT 'manual',
+      provider_customer_id        VARCHAR(255) NULL,
+      provider_subscription_id    VARCHAR(255) NULL,
+      current_period_start        TIMESTAMPTZ NULL,
+      current_period_end          TIMESTAMPTZ NULL,
+      trial_end                   TIMESTAMPTZ NULL,
+      cancel_at_period_end        SMALLINT NOT NULL DEFAULT 0,
+      created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Coach booking wizard support
+  await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS preferred_court_id INT NULL REFERENCES courts(id)");
+
+  // Stripe payment support
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_amount NUMERIC(10,2) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_currency VARCHAR(10) DEFAULT 'TND'");
+  await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS payment_amount NUMERIC(10,2) NULL");
+  await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50) NOT NULL DEFAULT 'pending'");
+  await pool.query("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS coaching_reservation_id INT NULL REFERENCES reservations(id)");
+
+  // Cancellation metadata and refund tracking
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_user_id INT NULL REFERENCES users(id)");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_actor_role VARCHAR(50) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_status VARCHAR(30) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS stripe_refund_id VARCHAR(255) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refunded_amount NUMERIC(10,2) NULL");
+  await pool.query("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_error TEXT NULL");
+  await pool.query("ALTER TABLE reservation_participants ALTER COLUMN user_id DROP NOT NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS email VARCHAR(191) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS display_name VARCHAR(191) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS role VARCHAR(32) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS slot INT NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'confirmed'");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS invitation_token VARCHAR(128) NULL");
+  await pool.query("ALTER TABLE reservation_participants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+  await pool.query(
+    `UPDATE reservation_participants rp
+     SET email = users.email,
+         display_name = CONCAT(users.first_name, ' ', users.last_name),
+         updated_at = NOW()
+     FROM users
+     WHERE rp.user_id = users.id
+       AND (rp.email IS NULL OR rp.email = '')`
+  );
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_reservation_participants_email ON reservation_participants (LOWER(email))");
+
+  await seedShowcaseArenas();
 }
 
 export async function closePool() {
@@ -318,8 +1206,7 @@ export async function createUser({
   lastName,
   email,
   passwordHash,
-  arenaId,
-  membershipRole,
+  membershipRole = "player",
   cinNumber = null,
   emailVerifiedAt = new Date().toISOString(),
 }) {
@@ -332,10 +1219,22 @@ export async function createUser({
        RETURNING id`,
       [firstName, lastName, email, passwordHash, membershipRole, cinNumber, emailVerifiedAt]
     );
+    const userId = Number(insert.rows[0].id);
     await client.query(
       `INSERT INTO arena_memberships (arena_id, user_id, role, status, created_at)
-       VALUES ($1, $2, $3, 'active', NOW())`,
-      [arenaId, Number(insert.rows[0].id), membershipRole]
+       SELECT id, $1, $2, 'active', NOW() FROM arenas
+       ON CONFLICT DO NOTHING`,
+      [userId, membershipRole]
+    );
+    await client.query(
+      `UPDATE reservation_participants
+       SET user_id = $1,
+           display_name = $2,
+           status = CASE WHEN status = 'pending_account' THEN 'confirmed' ELSE status END,
+           updated_at = NOW()
+       WHERE user_id IS NULL
+         AND LOWER(email) = LOWER($3)`,
+      [userId, `${firstName} ${lastName}`.trim(), email]
     );
     await client.query("COMMIT");
     return findUserByEmail(email);
@@ -350,7 +1249,7 @@ export async function createUser({
 export async function listCourts(actor = null) {
   const params = [];
   let where = "";
-  if (actor?.effective_role !== "super_admin" && actor?.arena_id) {
+  if (actor?.effective_role !== "super_admin" && actor?.effective_role !== "player" && actor?.arena_id) {
     params.push(actor.arena_id);
     where = `WHERE courts.arena_id = $${params.length}`;
   }
@@ -421,10 +1320,26 @@ export async function listReservationsForUser(userId) {
        reservations.id, reservations.user_id, reservations.court_id,
        reservations.reservation_date, reservations.start_time, reservations.end_time,
        reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+       reservations.cancelled_at, reservations.cancellation_reason, reservations.refund_status,
+       reservations.refunded_amount, reservations.payment_status, reservations.payment_amount,
+       reservations.payment_currency,
        courts.name AS court_name, courts.sport, courts.arena_id, arenas.name AS arena_name,
        COALESCE(
-         json_agg(json_build_object('id', participants.id, 'firstName', participants.first_name, 'lastName', participants.last_name, 'email', participants.email))
-         FILTER (WHERE participants.id IS NOT NULL),
+         json_agg(
+           json_build_object(
+             'id', rp_all.id,
+             'userId', participants.id,
+             'firstName', participants.first_name,
+             'lastName', participants.last_name,
+             'displayName', COALESCE(rp_all.display_name, NULLIF(TRIM(CONCAT(participants.first_name, ' ', participants.last_name)), '')),
+             'email', COALESCE(rp_all.email, participants.email),
+             'status', COALESCE(rp_all.status, 'confirmed'),
+             'role', COALESCE(rp_all.role, CASE WHEN participants.id = reservations.user_id THEN 'creator' ELSE 'participant' END),
+             'slot', rp_all.slot
+           )
+           ORDER BY COALESCE(rp_all.slot, 999), rp_all.id
+         )
+         FILTER (WHERE rp_all.id IS NOT NULL),
          '[]'::json
        ) AS participants
      FROM reservation_participants rp_self
@@ -441,6 +1356,57 @@ export async function listReservationsForUser(userId) {
   return rows.map(sanitizeReservation);
 }
 
+export async function getReservationForUser(reservationId, actor) {
+  const { rows } = await pool.query(
+    `SELECT
+       reservations.id, reservations.user_id, reservations.court_id,
+       reservations.reservation_date, reservations.start_time, reservations.end_time,
+       reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+       reservations.cancelled_at, reservations.cancellation_reason,
+       reservations.refund_status, reservations.refunded_amount, reservations.payment_status,
+       reservations.payment_amount, reservations.payment_currency, reservations.stripe_session_id,
+       courts.name AS court_name, courts.sport, courts.arena_id, arenas.name AS arena_name,
+       arenas.location AS arena_location,
+       COALESCE(
+         json_agg(
+           json_build_object(
+             'id', rp_all.id,
+             'userId', participants.id,
+             'firstName', participants.first_name,
+             'lastName', participants.last_name,
+             'displayName', COALESCE(rp_all.display_name, NULLIF(TRIM(CONCAT(participants.first_name, ' ', participants.last_name)), '')),
+             'email', COALESCE(rp_all.email, participants.email),
+             'status', COALESCE(rp_all.status, 'confirmed'),
+             'role', COALESCE(rp_all.role, CASE WHEN participants.id = reservations.user_id THEN 'creator' ELSE 'participant' END),
+             'slot', rp_all.slot
+           )
+           ORDER BY COALESCE(rp_all.slot, 999), rp_all.id
+         )
+         FILTER (WHERE rp_all.id IS NOT NULL),
+         '[]'::json
+       ) AS participants
+     FROM reservations
+     JOIN courts ON courts.id = reservations.court_id
+     JOIN arenas ON arenas.id = courts.arena_id
+     LEFT JOIN reservation_participants rp_all ON rp_all.reservation_id = reservations.id
+     LEFT JOIN users AS participants ON participants.id = rp_all.user_id
+     WHERE reservations.id = $1
+     GROUP BY reservations.id, courts.name, courts.sport, courts.arena_id, arenas.name, arenas.location
+     LIMIT 1`,
+    [reservationId]
+  );
+  const reservation = rows[0] ? sanitizeReservation(rows[0]) : null;
+  if (!reservation) return null;
+  const isParticipant = reservation.participants.some((participant) => Number(participant.userId) === Number(actor?.id));
+  const canAccess =
+    actor?.effective_role === "super_admin" ||
+    (actor?.effective_role === "admin" && actor?.arena_id && Number(actor.arena_id) === Number(reservation.arena_id)) ||
+    Number(reservation.user_id) === Number(actor?.id) ||
+    isParticipant;
+  if (!canAccess) throw new Error("You do not have access to this reservation");
+  return reservation;
+}
+
 export async function createReservation({ userId, courtId, reservationDate, startTime, endTime, qrToken, notes = "", participantEmails = [] }) {
   const client = await pool.connect();
   try {
@@ -454,7 +1420,7 @@ export async function createReservation({ userId, courtId, reservationDate, star
     const court = await getCourtByIdInternal(courtId, client);
     if (!court) throw new Error("Court not found");
     if (court.status !== "available") throw new Error("This court is not available for booking");
-    if (creator.effective_role !== "super_admin" && court.arena_id !== creator.arena_id) throw new Error("You can only reserve courts in your arena");
+    if (!["player", "super_admin"].includes(creator.effective_role) && court.arena_id !== creator.arena_id) throw new Error("You can only reserve courts in your arena");
 
     const startMinutes = timeToMinutes(startTime);
     const endMinutes = timeToMinutes(endTime);
@@ -464,23 +1430,32 @@ export async function createReservation({ userId, courtId, reservationDate, star
     if (startMinutes < openingMinutes || endMinutes > closingMinutes) throw new Error("Reservation must stay within the arena opening hours");
     if (await hasReservationConflict(courtId, reservationDate, startTime, endTime, client)) throw new Error("This slot is already reserved");
 
-    const rawEmails = [creator.email, ...participantEmails].map((email) => email.trim().toLowerCase()).filter(Boolean);
-    const uniqueEmails = [...new Set(rawEmails)];
-    if (uniqueEmails.length !== rawEmails.length) throw new Error("The same email cannot be used twice in a reservation");
-    if (uniqueEmails.length < Number(court.min_players) || uniqueEmails.length > Number(court.max_players)) throw new Error(`This court accepts between ${court.min_players} and ${court.max_players} players`);
+    const guestEmails = participantEmails.map(normalizeEmail).filter(Boolean);
+    const uniqueGuestEmails = [...new Set(guestEmails)];
+    if (uniqueGuestEmails.length !== guestEmails.length) throw new Error("The same email cannot be used twice in a reservation");
+    if (uniqueGuestEmails.some((email) => !isValidEmail(email))) throw new Error("Please enter valid participant emails");
+    if (uniqueGuestEmails.some((email) => email === normalizeEmail(creator.email))) throw new Error("The reservation creator is already included automatically");
 
-    const placeholders = uniqueEmails.map((_, index) => `$${index + 2}`).join(", ");
-    const { rows: participantRows } = await client.query(
-      `SELECT users.id, users.platform_role, users.status AS account_status, arena_memberships.status AS membership_status
-       FROM users
-       JOIN arena_memberships ON arena_memberships.user_id = users.id
-       WHERE arena_memberships.arena_id = $1
-         AND users.email IN (${placeholders})`,
-      [court.arena_id, ...uniqueEmails]
-    );
-    if (participantRows.length !== uniqueEmails.length) throw new Error("Every participant must already have an active account in this arena");
+    const totalPlayers = 1 + uniqueGuestEmails.length;
+    if (totalPlayers < Number(court.min_players) || totalPlayers > Number(court.max_players)) throw new Error(`This court accepts between ${court.min_players} and ${court.max_players} players`);
+
+    let participantRows = [];
+    if (uniqueGuestEmails.length) {
+      const placeholders = uniqueGuestEmails.map((_, index) => `$${index + 2}`).join(", ");
+      const queryResult = await client.query(
+        `SELECT users.id, users.first_name, users.last_name, users.email, users.platform_role,
+                users.status AS account_status, arena_memberships.status AS membership_status
+         FROM users
+         JOIN arena_memberships ON arena_memberships.user_id = users.id
+         WHERE arena_memberships.arena_id = $1
+           AND users.email IN (${placeholders})`,
+        [court.arena_id, ...uniqueGuestEmails]
+      );
+      participantRows = queryResult.rows;
+    }
     const invalid = participantRows.find((participant) => participant.platform_role === "super_admin" || participant.account_status !== "active" || participant.membership_status !== "active");
-    if (invalid) throw new Error("Every participant must already have an active account in this arena");
+    if (invalid) throw new Error("Only active player accounts can be linked to a reservation");
+    const participantByEmail = new Map(participantRows.map((participant) => [normalizeEmail(participant.email), participant]));
 
     const created = await client.query(
       `INSERT INTO reservations (user_id, court_id, reservation_date, start_time, end_time, status, qr_token, notes, created_at)
@@ -489,8 +1464,29 @@ export async function createReservation({ userId, courtId, reservationDate, star
       [userId, courtId, reservationDate, startTime, endTime, qrToken, notes]
     );
     const reservationId = Number(created.rows[0].id);
-    for (const participant of participantRows) {
-      await client.query(`INSERT INTO reservation_participants (reservation_id, user_id, created_at) VALUES ($1, $2, NOW())`, [reservationId, participant.id]);
+    await client.query(
+      `INSERT INTO reservation_participants (reservation_id, user_id, email, display_name, role, slot, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'creator', 1, 'confirmed', NOW(), NOW())`,
+      [reservationId, creator.id, normalizeEmail(creator.email), `${creator.first_name} ${creator.last_name}`.trim()]
+    );
+    for (const [index, email] of uniqueGuestEmails.entries()) {
+      const participant = participantByEmail.get(email);
+      const displayName = participant ? `${participant.first_name} ${participant.last_name}`.trim() : null;
+      const status = participant ? "confirmed" : "pending_account";
+      await client.query(
+        `INSERT INTO reservation_participants (reservation_id, user_id, email, display_name, role, slot, status, invitation_token, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'participant', $5, $6, $7, NOW(), NOW())`,
+        [reservationId, participant?.id ?? null, email, displayName, index + 2, status, participant ? null : randomUUID()]
+      );
+      if (participant?.id) {
+        await createNotification({
+          userId: participant.id,
+          title: "You were added to a reservation",
+          body: `${creator.first_name} ${creator.last_name} added you to ${court.name} on ${reservationDate} from ${startTime} to ${endTime}.`,
+          type: "reservation",
+          linkUrl: `/reservations/${reservationId}`,
+        });
+      }
     }
     await addActivityLog(client, { arenaId: court.arena_id, actorUserId: creator.id, actorName: `${creator.first_name} ${creator.last_name}`, action: "Reservation confirmee", detail: `${court.name} - ${reservationDate} ${startTime}-${endTime}` });
     await client.query("COMMIT");
@@ -504,14 +1500,18 @@ export async function createReservation({ userId, courtId, reservationDate, star
   }
 }
 
-export async function cancelReservation(id, actor) {
+export async function cancelReservation(id, actor, reason = null) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const { rows } = await client.query(
-      `SELECT reservations.*, courts.arena_id, courts.name AS court_name
+      `SELECT reservations.*, courts.arena_id, courts.name AS court_name,
+              arenas.name AS arena_name,
+              CONCAT(owner.first_name, ' ', owner.last_name) AS owner_name
        FROM reservations
        JOIN courts ON courts.id = reservations.court_id
+       JOIN arenas ON arenas.id = courts.arena_id
+       JOIN users AS owner ON owner.id = reservations.user_id
        WHERE reservations.id = $1
        LIMIT 1`,
       [id]
@@ -523,7 +1523,7 @@ export async function cancelReservation(id, actor) {
     }
     if (reservation.status === "cancelled") {
       await client.query("ROLLBACK");
-      return { success: true };
+      return { success: true, alreadyCancelled: true, reservation };
     }
     const participants = await client.query("SELECT user_id FROM reservation_participants WHERE reservation_id = $1", [id]);
     const isParticipant = participants.rows.some((p) => Number(p.user_id) === actor.id);
@@ -534,16 +1534,49 @@ export async function cancelReservation(id, actor) {
       const diffHours = (reservationStart.getTime() - Date.now()) / (1000 * 60 * 60);
       if (diffHours < 24) throw new Error("Reservations can only be cancelled at least 24 hours in advance");
     }
-    const result = await client.query("UPDATE reservations SET status = 'cancelled' WHERE id = $1", [id]);
-    await addActivityLog(client, { arenaId: reservation.arena_id, actorUserId: actor.id, actorName: `${actor.first_name} ${actor.last_name}`, action: canCancelRole ? "Reservation annulee (admin)" : "Reservation annulee", detail: `${reservation.court_name} - ${reservation.reservation_date} ${String(reservation.start_time).slice(0, 5)}` });
+    const actorRole = canCancelRole ? (actor.effective_role === "super_admin" ? "super_admin" : "admin") : "player";
+    const result = await client.query(
+      `UPDATE reservations
+       SET status = 'cancelled',
+           cancelled_at = NOW(),
+           cancelled_by_user_id = $2,
+           cancellation_reason = $3,
+           cancellation_actor_role = $4
+       WHERE id = $1`,
+      [id, actor.id, reason ?? null, actorRole]
+    );
+    // Cancel any linked training sessions and capture coach user id
+    const { rows: sessionRows } = await client.query(
+      `UPDATE training_sessions SET status = 'cancelled'
+       WHERE reservation_id = $1 AND status != 'cancelled'
+       RETURNING id, coach_user_id`,
+      [id]
+    );
+    const cancelledSession = sessionRows[0] ?? null;
+    await addActivityLog(client, {
+      arenaId: reservation.arena_id,
+      actorUserId: actor.id,
+      actorName: `${actor.first_name} ${actor.last_name}`,
+      action: canCancelRole ? "Reservation annulee (admin)" : "Reservation annulee",
+      detail: `${reservation.court_name} - ${reservation.reservation_date} ${String(reservation.start_time).slice(0, 5)}`,
+    });
     await client.query("COMMIT");
-    return { changes: result.rowCount, success: true };
+    return { changes: result.rowCount, success: true, reservation, cancelledSession };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
   } finally {
     client.release();
   }
+}
+
+export async function updateReservationRefund(id, { refundStatus, stripeRefundId = null, refundedAmount = null, refundError = null }) {
+  await pool.query(
+    `UPDATE reservations
+     SET refund_status = $2, stripe_refund_id = $3, refunded_amount = $4, refund_error = $5
+     WHERE id = $1`,
+    [id, refundStatus, stripeRefundId ?? null, refundedAmount ?? null, refundError ?? null]
+  );
 }
 
 export async function listAdminReservations(actor) {
@@ -878,6 +1911,126 @@ async function getArenaSubscriptionWithPlan(arenaId) {
   };
 }
 
+async function seedShowcaseArenas() {
+  for (const place of PADEL_PLACES) {
+    const { rows: upsertRows } = await pool.query(
+      `INSERT INTO arenas (name, slug, location, description, city, region, address, phone, email_contact, website, instagram, facebook, opening_hours, amenities, hero_image_url, gallery_images, has_padel, is_active, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16::jsonb, true, true, NOW())
+       ON CONFLICT (slug) DO UPDATE SET
+         description = EXCLUDED.description,
+         city = EXCLUDED.city,
+         region = EXCLUDED.region,
+         address = EXCLUDED.address,
+         opening_hours = EXCLUDED.opening_hours,
+         amenities = EXCLUDED.amenities,
+         hero_image_url = EXCLUDED.hero_image_url,
+         gallery_images = EXCLUDED.gallery_images,
+         has_padel = true,
+         is_active = true
+       RETURNING id`,
+      [
+        place.name,
+        place.slug,
+        place.location,
+        place.description ?? null,
+        place.city ?? null,
+        place.region ?? null,
+        place.address ?? null,
+        place.phone ?? null,
+        null,
+        place.website ?? null,
+        place.instagram ?? null,
+        place.facebook ?? null,
+        JSON.stringify(place.opening_hours ?? {}),
+        JSON.stringify(place.amenities ?? []),
+        place.hero_image_url ?? null,
+        JSON.stringify(place.gallery_images ?? []),
+      ]
+    );
+    const arenaId = Number(upsertRows[0].id);
+
+    for (const court of place.courts) {
+      const { rows: existingCourt } = await pool.query(
+        `SELECT id FROM courts WHERE arena_id = $1 AND name = $2 LIMIT 1`,
+        [arenaId, court.name]
+      );
+      if (existingCourt[0]) {
+        await pool.query(
+          `UPDATE courts SET
+             court_type = COALESCE(court_type, $1),
+             surface_type = COALESCE(surface_type, $2),
+             has_lighting = $3,
+             is_panoramic = $4,
+             price_per_hour = COALESCE(price_per_hour, $5),
+             currency = 'TND',
+             image_url = COALESCE(image_url, $6)
+           WHERE id = $7`,
+          [court.court_type, court.surface_type, court.has_lighting, court.is_panoramic, court.price_per_hour ?? null, court.image_url ?? null, existingCourt[0].id]
+        );
+        continue;
+      }
+      try {
+        await pool.query(
+          `INSERT INTO courts (arena_id, name, sport, status, has_summa, location, min_players, max_players, opening_time, closing_time, court_type, surface_type, has_lighting, is_panoramic, price_per_hour, currency, image_url, description, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::time, $10::time, $11, $12, $13, $14, $15, 'TND', $16, $17, NOW())`,
+          [
+            arenaId,
+            court.name,
+            court.sport,
+            court.status,
+            court.has_summa ? 1 : 0,
+            court.location,
+            court.min_players,
+            court.max_players,
+            court.opening_time,
+            court.closing_time,
+            court.court_type,
+            court.surface_type ?? null,
+            court.has_lighting ? true : false,
+            court.is_panoramic ? true : false,
+            court.price_per_hour ?? null,
+            court.image_url ?? null,
+            court.description ?? null,
+          ]
+        );
+      } catch (err) {
+        if (err?.code !== "23505") throw err;
+      }
+    }
+  }
+}
+
+async function assertCanAddArenaMember(arenaId, membershipRole) {
+  const subscription = await getArenaSubscriptionWithPlan(arenaId);
+  if (!subscription) {
+    throw new Error("No active subscription found for this arena");
+  }
+
+  if (!["trialing", "active"].includes(subscription.status)) {
+    throw new Error("Subscription is not active. Please update billing before adding users.");
+  }
+
+  const usage = await getArenaRoleUsage(arenaId);
+  const limits = {
+    admin: Number(subscription.max_admins ?? 0),
+    coach: Number(subscription.max_coaches ?? 0),
+    player: Number(subscription.max_players ?? 0),
+  };
+  const current = {
+    admin: usage.admins,
+    coach: usage.coaches,
+    player: usage.players,
+  };
+
+  if (!Object.prototype.hasOwnProperty.call(limits, membershipRole)) {
+    return;
+  }
+
+  if (current[membershipRole] >= limits[membershipRole]) {
+    throw new Error(`Plan limit reached for ${membershipRole} accounts. Please upgrade your subscription.`);
+  }
+}
+
 export async function createManagedUser({
   actor,
   firstName,
@@ -909,6 +2062,7 @@ export async function createManagedUser({
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    await assertCanAddArenaMember(finalArenaId, membershipRole);
     const insert = await client.query(
       `INSERT INTO users (first_name, last_name, email, password_hash, role, status, platform_role, cin_number, email_verified_at, created_at)
        VALUES ($1, $2, $3, $4, $5, 'active', 'member', $6, $7, NOW())
@@ -924,6 +2078,68 @@ export async function createManagedUser({
     await addActivityLog(client, { arenaId: finalArenaId, actorUserId: actor.id, actorName: `${actor.first_name} ${actor.last_name}`, action: "Compte cree par le staff", detail: `${managedFirstName} ${managedLastName} (${membershipRole})` });
     await client.query("COMMIT");
     return findUserById(userId);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateMembershipRole(actor, targetUserId, nextRole, nextArenaId = null) {
+  if (!["player", "coach", "admin"].includes(nextRole)) throw new Error("Invalid role");
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  if (actor.id === targetUserId) throw new Error("You cannot change your own role");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const target = await findUserById(targetUserId, client);
+    if (!target) throw new Error("User not found");
+    if (target.platform_role === "super_admin") throw new Error("Super admin roles cannot be changed here");
+
+    let resolvedArenaId = nextArenaId ? Number(nextArenaId) : Number(target.arena_id);
+    if (actor.effective_role === "super_admin") {
+      if (!resolvedArenaId) throw new Error("Arena is required");
+    } else {
+      if (Number(target.arena_id) !== Number(actor.arena_id)) throw new Error("You can only manage users in your arena");
+      if (!["player", "coach"].includes(nextRole)) throw new Error("Arena admins can only assign player or coach roles");
+      if (target.membership_role === "admin") throw new Error("Only a super admin can change admin roles");
+      resolvedArenaId = Number(actor.arena_id);
+    }
+
+    if (target.membership_role === nextRole && Number(target.arena_id) === Number(resolvedArenaId)) {
+      await client.query("COMMIT");
+      return target;
+    }
+
+    await assertCanAddArenaMember(resolvedArenaId, nextRole);
+    await client.query("UPDATE users SET role = $1 WHERE id = $2", [nextRole, targetUserId]);
+    const memberships = await client.query("SELECT id, arena_id FROM arena_memberships WHERE user_id = $1 ORDER BY id ASC", [targetUserId]);
+    const existingForArena = memberships.rows.find((row) => Number(row.arena_id) === Number(resolvedArenaId));
+    const keptMembership = existingForArena ?? memberships.rows[0] ?? null;
+    if (keptMembership?.id) {
+      await client.query(
+        "UPDATE arena_memberships SET arena_id = $1, role = $2, status = 'active' WHERE id = $3",
+        [resolvedArenaId, nextRole, keptMembership.id]
+      );
+      await client.query("DELETE FROM arena_memberships WHERE user_id = $1 AND id <> $2", [targetUserId, keptMembership.id]);
+    } else {
+      await client.query(
+        `INSERT INTO arena_memberships (arena_id, user_id, role, status, created_at)
+         VALUES ($1, $2, $3, 'active', NOW())`,
+        [resolvedArenaId, targetUserId, nextRole]
+      );
+    }
+    await addActivityLog(client, {
+      arenaId: resolvedArenaId,
+      actorUserId: actor.id,
+      actorName: `${actor.first_name} ${actor.last_name}`,
+      action: "Role utilisateur mis a jour",
+      detail: `${target.first_name} ${target.last_name}: ${target.membership_role} -> ${nextRole}`,
+    });
+    await client.query("COMMIT");
+    return findUserById(targetUserId);
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -958,21 +2174,23 @@ export async function createCourt({ actor, arenaId, name, sport, location, hasSu
   }
 }
 
-export async function createAnalysis({ userId, title, videoName }) {
+export async function createAnalysis({ userId, title, videoName, uploaderUserId = null, subjectUserId = null, matchId = null, storagePath = null, status = "queued", summary = null }) {
   const created = await pool.query(
-    `INSERT INTO ai_analyses (user_id, title, video_name, status, summary, created_at)
-     VALUES ($1, $2, $3, 'queued', $4, NOW())
+    `INSERT INTO ai_analyses (user_id, title, video_name, status, summary, uploader_user_id, subject_user_id, match_id, storage_path, uploaded_at, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
      RETURNING id`,
-    [userId, title, videoName, "Analyse planifiee pour le moteur SmartPlay AI."]
+    [userId, title, videoName, status, summary ?? "Analyse en attente de traitement par le module IA.", uploaderUserId ?? userId, subjectUserId ?? userId, matchId, storagePath]
   );
   const id = Number(created.rows[0].id);
   const { rows } = await pool.query(
-    `SELECT id, title, video_name AS "videoName", status, summary, created_at AS "createdAt"
+    `SELECT id, user_id AS "userId", title, video_name AS "videoName", status, summary,
+            uploader_user_id AS "uploaderUserId", subject_user_id AS "subjectUserId", match_id AS "matchId",
+            storage_path AS "storagePath", uploaded_at AS "uploadedAt", created_at AS "createdAt"
      FROM ai_analyses
      WHERE id = $1`,
     [id]
   );
-  return { ...rows[0], createdAt: toIso(rows[0].createdAt) };
+  return { ...rows[0], uploadedAt: toIso(rows[0].uploadedAt), createdAt: toIso(rows[0].createdAt) };
 }
 
 export async function getAdminOverview(actor) {
@@ -996,7 +2214,8 @@ export async function getAdminOverview(actor) {
     params
   );
   const userRows = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, users.email, users.platform_role, users.status,
+    `SELECT DISTINCT ON (users.id)
+            users.id, users.first_name, users.last_name, users.email, users.platform_role, users.status,
             arena_memberships.role AS membership_role, arena_memberships.status AS membership_status,
             arenas.id AS arena_id, arenas.name AS arena_name, users.created_at
      FROM users
@@ -1162,7 +2381,7 @@ export async function getCompetitionDetails(competitionId) {
   const comp = await pool.query(
     `SELECT competitions.*, arenas.name AS arena_name
      FROM competitions
-     JOIN arenas ON arenas.id = competitions.arena_id
+     LEFT JOIN arenas ON arenas.id = competitions.arena_id
      WHERE competitions.id = $1
      LIMIT 1`,
     [competitionId]
@@ -1170,7 +2389,8 @@ export async function getCompetitionDetails(competitionId) {
   const competition = comp.rows[0];
   if (!competition) return null;
   const participants = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, latest.ranking_score AS ranking
+    `SELECT users.id, users.first_name, users.last_name, latest.ranking_score AS ranking,
+            competition_registrations.registered_at
      FROM competition_registrations
      JOIN users ON users.id = competition_registrations.user_id
      LEFT JOIN (
@@ -1178,20 +2398,122 @@ export async function getCompetitionDetails(competitionId) {
        FROM performance_snapshots
      ) latest ON latest.user_id = users.id AND latest.rn = 1
      WHERE competition_registrations.competition_id = $1
-       AND competition_registrations.status = 'registered'`,
+       AND competition_registrations.status = 'registered'
+     ORDER BY competition_registrations.id ASC`,
     [competitionId]
   );
   return {
     ...sanitizeCompetition(competition),
-    participants: participants.rows.map((p) => ({ id: p.id, name: `${p.first_name} ${p.last_name}`, ranking: Number(p.ranking ?? 1000) })),
-    rules: "Matchs en 2 sets gagnants. Point decisif a 40-40. Super tie-break en cas de 3eme set.",
-    prizes: "1er: 500€ + Trophee | 2eme: 200€ | 3eme: 100€",
+    participants: participants.rows.map((p) => ({
+      id: p.id,
+      name: `${p.first_name} ${p.last_name}`,
+      ranking: Number(p.ranking ?? 1000),
+      registeredAt: toIso(p.registered_at),
+    })),
+    rules: competition.rules ?? null,
+    prizes: competition.prizes ?? null,
   };
+}
+
+export async function createCompetition(actor, { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, rules, prizes }) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const arenaId = actor.effective_role === "super_admin" ? (actor.arena_id ?? null) : actor.arena_id;
+  if (!arenaId) throw new Error("No arena associated with this admin account");
+  const { rows } = await pool.query(
+    `INSERT INTO competitions (arena_id, name, sport, description, start_date, end_date, registration_deadline, location, max_participants, status, rules, prizes, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, NOW())
+     RETURNING *`,
+    [arenaId, name, sport, description ?? null, startDate, endDate ?? null, registrationDeadline ?? null, location, maxParticipants, rules ?? null, prizes ?? null]
+  );
+  return sanitizeCompetition(rows[0]);
+}
+
+export async function updateCompetition(actor, competitionId, { name, sport, description, startDate, endDate, registrationDeadline, location, maxParticipants, status, rules, prizes }) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const existing = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!existing.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(existing.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized to edit this competition");
+  }
+  const { rows } = await pool.query(
+    `UPDATE competitions
+     SET name = COALESCE($2, name),
+         sport = COALESCE($3, sport),
+         description = COALESCE($4, description),
+         start_date = COALESCE($5, start_date),
+         end_date = $6,
+         registration_deadline = $7,
+         location = COALESCE($8, location),
+         max_participants = COALESCE($9, max_participants),
+         status = COALESCE($10, status),
+         rules = $11,
+         prizes = $12
+     WHERE id = $1
+     RETURNING *`,
+    [competitionId, name, sport, description, startDate, endDate ?? null, registrationDeadline ?? null, location, maxParticipants, status, rules ?? null, prizes ?? null]
+  );
+  return sanitizeCompetition(rows[0]);
+}
+
+export async function deleteCompetition(actor, competitionId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const existing = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!existing.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(existing.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized to delete this competition");
+  }
+  await pool.query("DELETE FROM competition_registrations WHERE competition_id = $1", [competitionId]);
+  await pool.query("DELETE FROM competitions WHERE id = $1", [competitionId]);
+  return { success: true };
+}
+
+export async function listCompetitionRegistrations(actor, competitionId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const comp = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!comp.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(comp.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized");
+  }
+  const { rows } = await pool.query(
+    `SELECT cr.id, cr.user_id, cr.status, cr.registered_at,
+            u.first_name, u.last_name, u.email,
+            COALESCE(ps.ranking_score, 1000) AS ranking_score
+     FROM competition_registrations cr
+     JOIN users u ON u.id = cr.user_id
+     LEFT JOIN LATERAL (
+       SELECT ranking_score FROM performance_snapshots WHERE user_id = u.id ORDER BY id DESC LIMIT 1
+     ) ps ON true
+     WHERE cr.competition_id = $1
+     ORDER BY cr.registered_at ASC`,
+    [competitionId]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    firstName: r.first_name,
+    lastName: r.last_name,
+    email: r.email,
+    status: r.status,
+    rankingScore: Number(r.ranking_score),
+    registeredAt: toIso(r.registered_at),
+  }));
+}
+
+export async function removeCompetitionRegistration(actor, competitionId, userId) {
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const comp = await pool.query("SELECT * FROM competitions WHERE id = $1 LIMIT 1", [competitionId]);
+  if (!comp.rows[0]) throw new Error("Competition not found");
+  if (actor.effective_role !== "super_admin" && Number(comp.rows[0].arena_id) !== Number(actor.arena_id)) {
+    throw new Error("Not authorized");
+  }
+  await pool.query("DELETE FROM competition_registrations WHERE competition_id = $1 AND user_id = $2", [competitionId, userId]);
+  return { success: true };
 }
 export async function getReservationTicketDetails(reservationId, actor) {
   const details = await pool.query(
     `SELECT reservations.id, reservations.reservation_date, reservations.start_time, reservations.end_time,
             reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+            reservations.payment_status, reservations.payment_amount, reservations.payment_currency,
             courts.name AS court_name, courts.sport, arenas.id AS arena_id, arenas.name AS arena_name, arenas.location AS arena_location,
             owner.first_name AS owner_first_name, owner.last_name AS owner_last_name
      FROM reservations
@@ -1206,18 +2528,21 @@ export async function getReservationTicketDetails(reservationId, actor) {
   if (!reservation) throw new Error("Reservation not found");
 
   const participantsQuery = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, users.email
+    `SELECT reservation_participants.id, reservation_participants.user_id,
+            reservation_participants.email, reservation_participants.display_name,
+            reservation_participants.status, reservation_participants.role,
+            users.first_name, users.last_name, users.email AS user_email
      FROM reservation_participants
-     JOIN users ON users.id = reservation_participants.user_id
+     LEFT JOIN users ON users.id = reservation_participants.user_id
      WHERE reservation_participants.reservation_id = $1
-     ORDER BY users.first_name ASC, users.last_name ASC`,
+     ORDER BY COALESCE(reservation_participants.slot, 999), reservation_participants.id`,
     [reservationId]
   );
   const participants = participantsQuery.rows;
   const canAccess =
     actor?.effective_role === "super_admin" ||
     (actor?.effective_role === "admin" && actor?.arena_id && Number(actor.arena_id) === Number(reservation.arena_id)) ||
-    participants.some((participant) => Number(participant.id) === Number(actor?.id));
+    participants.some((participant) => Number(participant.user_id) === Number(actor?.id));
   if (!canAccess) throw new Error("You do not have access to this reservation ticket");
 
   const payload = `${reservation.id}|${reservation.qr_token}|${String(reservation.reservation_date).slice(0, 10)}|${String(reservation.start_time).slice(0, 8)}|${String(reservation.end_time).slice(0, 8)}`;
@@ -1229,6 +2554,9 @@ export async function getReservationTicketDetails(reservationId, actor) {
     startTime: String(reservation.start_time).slice(0, 5),
     endTime: String(reservation.end_time).slice(0, 5),
     status: reservation.status,
+    paymentStatus: reservation.payment_status ?? "paid",
+    paymentAmount: reservation.payment_amount,
+    paymentCurrency: reservation.payment_currency ?? "TND",
     qrToken: reservation.qr_token,
     notes: reservation.notes ?? "",
     createdAt: toIso(reservation.created_at),
@@ -1237,7 +2565,13 @@ export async function getReservationTicketDetails(reservationId, actor) {
     arenaName: reservation.arena_name,
     arenaLocation: reservation.arena_location,
     ownerName: `${reservation.owner_first_name} ${reservation.owner_last_name}`,
-    participants: participants.map((participant) => ({ id: participant.id, name: `${participant.first_name} ${participant.last_name}`, email: participant.email })),
+    participants: participants.map((participant) => ({
+      id: participant.user_id,
+      name: participant.display_name ?? `${participant.first_name ?? ""} ${participant.last_name ?? ""}`.trim() ?? participant.email,
+      email: participant.email ?? participant.user_email,
+      status: participant.status,
+      role: participant.role,
+    })),
     signature,
     specialCode,
   };
@@ -1247,6 +2581,7 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
   const details = await pool.query(
     `SELECT reservations.id, reservations.reservation_date, reservations.start_time, reservations.end_time,
             reservations.status, reservations.qr_token, reservations.notes, reservations.created_at,
+            reservations.payment_status, reservations.payment_amount, reservations.payment_currency,
             courts.name AS court_name, courts.sport, arenas.name AS arena_name, arenas.location AS arena_location,
             owner.first_name AS owner_first_name, owner.last_name AS owner_last_name
      FROM reservations
@@ -1260,12 +2595,16 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
   );
   const reservation = details.rows[0];
   if (!reservation) throw new Error("Invalid ticket link or reservation");
+  if (reservation.payment_status !== "paid") throw new Error("Payment required");
   const participantsQuery = await pool.query(
-    `SELECT users.id, users.first_name, users.last_name, users.email
+    `SELECT reservation_participants.id, reservation_participants.user_id,
+            reservation_participants.email, reservation_participants.display_name,
+            reservation_participants.status, reservation_participants.role,
+            users.first_name, users.last_name, users.email AS user_email
      FROM reservation_participants
-     JOIN users ON users.id = reservation_participants.user_id
+     LEFT JOIN users ON users.id = reservation_participants.user_id
      WHERE reservation_participants.reservation_id = $1
-     ORDER BY users.first_name ASC, users.last_name ASC`,
+     ORDER BY COALESCE(reservation_participants.slot, 999), reservation_participants.id`,
     [reservationId]
   );
   const payload = `${reservation.id}|${reservation.qr_token}|${String(reservation.reservation_date).slice(0, 10)}|${String(reservation.start_time).slice(0, 8)}|${String(reservation.end_time).slice(0, 8)}`;
@@ -1277,6 +2616,9 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
     startTime: String(reservation.start_time).slice(0, 5),
     endTime: String(reservation.end_time).slice(0, 5),
     status: reservation.status,
+    paymentStatus: reservation.payment_status ?? "paid",
+    paymentAmount: reservation.payment_amount,
+    paymentCurrency: reservation.payment_currency ?? "TND",
     qrToken: reservation.qr_token,
     notes: reservation.notes ?? "",
     createdAt: toIso(reservation.created_at),
@@ -1285,7 +2627,13 @@ export async function getReservationTicketDetailsByQr(reservationId, qrToken) {
     arenaName: reservation.arena_name,
     arenaLocation: reservation.arena_location,
     ownerName: `${reservation.owner_first_name} ${reservation.owner_last_name}`,
-    participants: participantsQuery.rows.map((participant) => ({ id: participant.id, name: `${participant.first_name} ${participant.last_name}`, email: participant.email })),
+    participants: participantsQuery.rows.map((participant) => ({
+      id: participant.user_id,
+      name: participant.display_name ?? `${participant.first_name ?? ""} ${participant.last_name ?? ""}`.trim() ?? participant.email,
+      email: participant.email ?? participant.user_email,
+      status: participant.status,
+      role: participant.role,
+    })),
     signature,
     specialCode,
   };
@@ -1337,46 +2685,105 @@ function loadUltimaLogoJpeg() {
 }
 
 export function generateReservationTicketPdfBuffer(ticket) {
-  const line = (text = "") => String(text).replace(/[()]/g, "").slice(0, 110);
-  const participants = (ticket.participants || []).slice(0, 8).map((participant, index) => `${index + 1}. ${participant.name} <${participant.email}>`);
+  const line = (text = "") => String(text).replace(/[()\\]/g, "").slice(0, 96);
+  const participantStatus = (status) => status === "pending_account" ? "Pending account" : status === "invited" ? "Invited" : status === "cancelled" ? "Cancelled" : "Confirmed";
+  const participants = (ticket.participants || []).slice(0, 10).map((participant, index) => {
+    const role = participant.role === "creator" ? "Creator" : `Participant ${index + 1}`;
+    return `${role}: ${participant.name || participant.email} - ${participant.email} - ${participantStatus(participant.status)}`;
+  });
   const specialCode = ticket.specialCode || `ULT-${ticket.id}-${ticket.signature.slice(0, 8)}`;
   const qrPayload = `ULTIMA|TICKET|${ticket.id}|${ticket.qrToken}|${specialCode}`;
-  const contentLines = [
-    `Ticket ID: #${ticket.id}`,
-    `Arena: ${ticket.arenaName} (${ticket.arenaLocation || "N/A"})`,
-    `Court: ${ticket.courtName} - ${ticket.sport}`,
-    `Date: ${ticket.reservationDate}`,
-    `Time: ${ticket.startTime} - ${ticket.endTime}`,
-    `Status: ${ticket.status}`,
-    `Owner: ${ticket.ownerName}`,
-    `QR Token: ${ticket.qrToken}`,
-    "",
-    "Participants:",
-    ...participants,
-    "",
-    `Notes: ${ticket.notes || "N/A"}`,
-    "",
-    `Special Verification Code: ${specialCode}`,
-    `Digital Signature: ${ticket.signature}`,
-    `Generated At: ${new Date().toISOString()}`,
+  const durationMinutes = (() => {
+    const [sh, sm] = String(ticket.startTime).split(":").map(Number);
+    const [eh, em] = String(ticket.endTime).split(":").map(Number);
+    if (![sh, sm, eh, em].every(Number.isFinite)) return "N/A";
+    return `${(eh * 60 + em) - (sh * 60 + sm)} min`;
+  })();
+  const paymentAmount = ticket.paymentAmount ? `${Number(ticket.paymentAmount).toFixed(3)} ${ticket.paymentCurrency || "TND"}` : "Paid via Stripe";
+  const card = (x, y, w, h) => [
+    "1 1 1 rg", `${x} ${y} ${w} ${h} re`, "f",
+    "0.86 0.88 0.93 RG", "0.8 w", `${x} ${y} ${w} ${h} re`, "S",
   ];
-  const stream = ["0.88 0.84 0.98 rg", "0 0 595 842 re", "f", "0.08 0.06 0.16 rg", "0 760 595 82 re", "f", "0.16 0.12 0.3 rg", "BT", "/F1 26 Tf", "120 798 Td", "(ULTIMA RESERVATION PASS) Tj", "ET", "q", "74 0 0 54 42 772 cm", "/Im1 Do", "Q", "0.16 0.12 0.3 rg", "BT", "/F1 11 Tf", "50 730 Td", "14 TL"];
-  for (let index = 0; index < contentLines.length; index += 1) {
-    const text = line(contentLines[index]);
-    if (index === 0) stream.push(`(${text}) Tj`);
-    else {
-      stream.push("T*");
-      stream.push(`(${text}) Tj`);
-    }
-  }
-  stream.push("ET", "0.24 0.22 0.35 RG", "2 w", "40 50 515 740 re", "S", ...buildQrPdfCommands(qrPayload, 430, 74, 112), "0.16 0.12 0.3 rg", "BT", "/F1 8 Tf", "430 62 Td", "(Reservation QR - scan to verify) Tj", "ET");
+  const text = (x, y, value, size = 10, font = "F2", color = "0.10 0.13 0.22") => [
+    `${color} rg`, "BT", `/${font} ${size} Tf`, `${x} ${y} Td`, `(${line(value)}) Tj`, "ET",
+  ];
+  const pill = (x, y, w, label) => [
+    "0.98 0.78 0.22 rg", `${x} ${y} ${w} 24 re`, "f",
+    ...text(x + 12, y + 8, label, 8, "F1", "0.05 0.07 0.14"),
+  ];
+  const rows = [
+    ["ARENA", ticket.arenaName],
+    ["LOCATION", ticket.arenaLocation || "N/A"],
+    ["COURT", `${ticket.courtName} - ${ticket.sport}`],
+    ["DATE", ticket.reservationDate],
+    ["TIME", `${ticket.startTime} - ${ticket.endTime}`],
+    ["DURATION", durationMinutes],
+    ["BOOKED BY", ticket.ownerName],
+    ["PAYMENT", `${ticket.paymentStatus || "paid"} - ${paymentAmount}`],
+  ];
+
+  const stream = [
+    "0.04 0.06 0.13 rg", "0 0 595 842 re", "f",
+    "0.07 0.10 0.20 rg", "26 26 543 790 re", "f",
+    "0.98 0.78 0.22 rg", "26 26 6 790 re", "f",
+    "0.12 0.16 0.28 rg", "52 56 491 720 re", "f",
+    "1 1 1 rg", "52 56 491 720 re", "f",
+    "0.05 0.07 0.14 rg", "52 654 491 122 re", "f",
+    "0.98 0.78 0.22 rg", "52 654 491 5 re", "f",
+    "q", "76 0 0 56 74 692 cm", "/Im1 Do", "Q",
+    ...text(160, 730, "ULTIMA COURT PASS", 26, "F1", "1 1 1"),
+    ...text(162, 710, "Paid reservation ticket with SmartPlay-ready details", 9, "F2", "0.78 0.83 0.92"),
+    ...pill(418, 710, 94, "STRIPE PAID"),
+    ...text(74, 628, `Reservation #${ticket.id}`, 19, "F1"),
+    ...text(74, 608, `${ticket.status} court reservation`, 9, "F2", "0.38 0.43 0.53"),
+    ...card(74, 500, 280, 88),
+    ...text(92, 560, "MATCH WINDOW", 8, "F1", "0.48 0.52 0.62"),
+    ...text(92, 538, ticket.reservationDate, 17, "F1"),
+    ...text(92, 518, `${ticket.startTime} - ${ticket.endTime}   (${durationMinutes})`, 10, "F2", "0.24 0.28 0.38"),
+    ...card(74, 390, 280, 88),
+    ...text(92, 450, "VENUE", 8, "F1", "0.48 0.52 0.62"),
+    ...text(92, 428, ticket.arenaName, 15, "F1"),
+    ...text(92, 410, `${ticket.courtName} - ${ticket.sport}`, 10, "F2", "0.24 0.28 0.38"),
+    ...card(374, 390, 138, 198),
+    "0.98 0.78 0.22 rg", "388 526 110 110 re", "f",
+    "1 1 1 rg", "394 532 98 98 re", "f",
+    ...buildQrPdfCommands(qrPayload, 400, 538, 86),
+    ...text(394, 508, "SCAN TO VERIFY", 8, "F1"),
+    ...text(390, 492, "QR appears only after", 7, "F2", "0.38 0.43 0.53"),
+    ...text(392, 480, "Stripe payment is paid.", 7, "F2", "0.38 0.43 0.53"),
+    ...card(74, 252, 438, 110),
+    ...text(92, 334, "PARTICIPANTS", 9, "F1", "0.48 0.52 0.62"),
+  ];
+  const participantLines = participants.length ? participants.slice(0, 6) : ["No participants listed"];
+  participantLines.forEach((participant, index) => {
+    stream.push(...text(92, 314 - index * 15, participant, 8, "F2"));
+  });
+  if (participants.length > 6) stream.push(...text(92, 314 - 6 * 15, `+${participants.length - 6} more participants`, 8, "F2", "0.38 0.43 0.53"));
+
+  stream.push(
+    ...card(74, 126, 438, 94),
+    ...text(92, 194, "RESERVATION DETAILS", 9, "F1", "0.48 0.52 0.62"),
+  );
+  rows.forEach(([label, value], index) => {
+    const x = index % 2 === 0 ? 92 : 292;
+    const y = 174 - Math.floor(index / 2) * 24;
+    stream.push(...text(x, y + 10, label, 6, "F1", "0.52 0.56 0.66"));
+    stream.push(...text(x, y, value, 8, "F2"));
+  });
+
+  stream.push(
+    "0.05 0.07 0.14 rg", "74 76 438 30 re", "f",
+    ...text(92, 92, `VERIFY: ${specialCode}`, 9, "F1", "1 1 1"),
+    ...text(310, 92, `SIGNATURE: ${ticket.signature}`, 6, "F2", "0.78 0.83 0.92"),
+    ...text(74, 42, `Generated ${new Date().toISOString()} - ULTIMA SmartPlay Arena Platform`, 7, "F2", "0.78 0.83 0.92")
+  );
   const contentStream = `${stream.join("\n")}\n`;
   const contentLength = Buffer.byteLength(contentStream, "utf8");
   const logo = loadUltimaLogoJpeg();
   const objects = [];
   objects.push(Buffer.from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n", "utf8"));
   objects.push(Buffer.from("2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n", "utf8"));
-  objects.push(Buffer.from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>\nendobj\n", "utf8"));
+  objects.push(Buffer.from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 7 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>\nendobj\n", "utf8"));
   objects.push(Buffer.from("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n", "utf8"));
   objects.push(Buffer.from(`5 0 obj\n<< /Length ${contentLength} >>\nstream\n${contentStream}endstream\nendobj\n`, "utf8"));
   if (logo) {
@@ -1386,6 +2793,7 @@ export function generateReservationTicketPdfBuffer(ticket) {
   } else {
     objects.push(Buffer.from("6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\xFF\xFF\xFF\nendstream\nendobj\n", "binary"));
   }
+  objects.push(Buffer.from("7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n", "utf8"));
   let offset = Buffer.byteLength("%PDF-1.4\n", "utf8");
   const xrefOffsets = [0];
   for (const object of objects) {
@@ -1501,54 +2909,151 @@ export async function listCoachRelationshipExpiryReminders(userId, days = 7) {
   }));
 }
 export async function getPerformanceForUser(userId) {
-  const snapshots = await pool.query(
-    `SELECT week_label, ranking_score, wins, losses, created_at
-     FROM performance_snapshots
-     WHERE user_id = $1
-     ORDER BY id ASC`,
-    [userId]
-  );
-  const profile = await pool.query(
-    `SELECT service, return_skill, volley, endurance, strategy, mental, updated_at
-     FROM performance_profiles
-     WHERE user_id = $1
-     LIMIT 1`,
-    [userId]
-  );
-  const rows = snapshots.rows;
-  const latest = rows.at(-1) ?? null;
-  const p = profile.rows[0] ?? null;
-  return {
-    summary: latest
-      ? {
-          rankingScore: Number(latest.ranking_score),
-          winRate: `${Math.max(60, 70 + rows.length)}%`,
-          streak: `${Math.min(5, rows.length)} victoires`,
-          matchesThisMonth: rows.length,
-        }
-      : null,
-    progress: rows.map((row) => ({ semaine: row.week_label, score: row.ranking_score, victoires: row.wins, defaites: row.losses })),
-    radar: p
-      ? [
-          { skill: "Service", value: p.service },
-          { skill: "Retour", value: p.return_skill },
-          { skill: "Volee", value: p.volley },
-          { skill: "Endurance", value: p.endurance },
-          { skill: "Strategie", value: p.strategy },
-          { skill: "Mental", value: p.mental },
-        ]
-      : [],
-  };
+  try {
+    const snapshots = await pool.query(
+      `SELECT week_label, ranking_score, wins, losses, created_at
+       FROM performance_snapshots
+       WHERE user_id = $1
+       ORDER BY id ASC`,
+      [userId]
+    );
+    const profile = await pool.query(
+      `SELECT service, return_skill, volley, endurance, strategy, mental, updated_at
+       FROM performance_profiles
+       WHERE user_id = $1
+       LIMIT 1`,
+      [userId]
+    );
+    const rows = snapshots.rows;
+    const latest = rows.at(-1) ?? null;
+    const p = profile.rows[0] ?? null;
+    const totalWins = rows.reduce((sum, row) => sum + Number(row.wins ?? 0), 0);
+    const totalLosses = rows.reduce((sum, row) => sum + Number(row.losses ?? 0), 0);
+    const totalMatches = totalWins + totalLosses;
+
+    return {
+      summary: latest
+        ? {
+            rankingScore: Number(latest.ranking_score),
+            winRate: totalMatches ? `${Math.round((totalWins / totalMatches) * 100)}%` : "0%",
+            streak: `${Math.min(5, rows.length)} victoires`,
+            matchesThisMonth: rows.length,
+            wins: totalWins,
+            losses: totalLosses,
+          }
+        : null,
+      progress: rows.map((row) => ({ semaine: row.week_label, score: row.ranking_score, victoires: row.wins, defaites: row.losses })),
+      radar: p
+        ? [
+            { skill: "Service", value: p.service },
+            { skill: "Retour", value: p.return_skill },
+            { skill: "Volee", value: p.volley },
+            { skill: "Endurance", value: p.endurance },
+            { skill: "Strategie", value: p.strategy },
+            { skill: "Mental", value: p.mental },
+          ]
+        : [],
+    };
+  } catch {
+    return {
+      summary: null,
+      progress: [],
+      radar: [],
+    };
+  }
 }
 export async function listAnalysesForUser(userId) {
-  const { rows } = await pool.query(
-    `SELECT id, title, video_name AS "videoName", status, summary, created_at AS "createdAt"
-     FROM ai_analyses
-     WHERE user_id = $1
-     ORDER BY created_at DESC`,
-    [userId]
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, user_id AS "userId", title, video_name AS "videoName", status, summary,
+              uploader_user_id AS "uploaderUserId", subject_user_id AS "subjectUserId", match_id AS "matchId",
+              storage_path AS "storagePath", uploaded_at AS "uploadedAt", created_at AS "createdAt"
+       FROM ai_analyses
+       WHERE user_id = $1 OR subject_user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    return rows.map((row) => ({ ...row, uploadedAt: toIso(row.uploadedAt), createdAt: toIso(row.createdAt) }));
+  } catch {
+    return [];
+  }
+}
+
+export async function persistRefreshToken(userId, token, expiresAt) {
+  await pool.query(
+    `INSERT INTO refresh_tokens (user_id, token, expires_at, created_at)
+     VALUES ($1, $2, $3, NOW())`,
+    [userId, token, expiresAt]
   );
-  return rows.map((row) => ({ ...row, createdAt: toIso(row.createdAt) }));
+}
+
+export async function consumeRefreshToken(token) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT * FROM refresh_tokens
+       WHERE token = $1
+         AND revoked_at IS NULL
+         AND expires_at > NOW()
+       LIMIT 1
+       FOR UPDATE`,
+      [token]
+    );
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+    await client.query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1", [rows[0].id]);
+    await client.query("COMMIT");
+    return rows[0];
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function revokeRefreshTokensForUser(userId) {
+  await pool.query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", [userId]);
+}
+
+export async function listNotificationsForUser(userId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, body, type, link_url AS "linkUrl", read_at AS "readAt", created_at AS "createdAt"
+       FROM notifications
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+    return rows.map((row) => ({ ...row, readAt: toIso(row.readAt), createdAt: toIso(row.createdAt) }));
+  } catch {
+    return [];
+  }
+}
+
+export async function createNotification({ userId, title, body, type = "info", linkUrl = null }) {
+  const { rows } = await pool.query(
+    `INSERT INTO notifications (user_id, title, body, type, link_url, created_at)
+     VALUES ($1, $2, $3, $4, $5, NOW())
+     RETURNING id, title, body, type, link_url AS "linkUrl", read_at AS "readAt", created_at AS "createdAt"`,
+    [userId, title, body, type, linkUrl]
+  );
+  return { ...rows[0], readAt: toIso(rows[0].readAt), createdAt: toIso(rows[0].createdAt) };
+}
+
+export async function markNotificationRead(userId, notificationId) {
+  const { rows } = await pool.query(
+    `UPDATE notifications
+     SET read_at = COALESCE(read_at, NOW())
+     WHERE id = $1 AND user_id = $2
+     RETURNING id, title, body, type, link_url AS "linkUrl", read_at AS "readAt", created_at AS "createdAt"`,
+    [notificationId, userId]
+  );
+  return rows[0] ? { ...rows[0], readAt: toIso(rows[0].readAt), createdAt: toIso(rows[0].createdAt) } : null;
 }
 export async function listCoachStudents(coachUserId) {
   const actor = await getCoachActor(coachUserId);
@@ -1676,7 +3181,7 @@ export async function listCompetitions(actor = null) {
   const { rows } = await pool.query(
     `SELECT competitions.*, arenas.name AS arena_name, COUNT(competition_registrations.id)::int AS participants
      FROM competitions
-     JOIN arenas ON arenas.id = competitions.arena_id
+     LEFT JOIN arenas ON arenas.id = competitions.arena_id
      LEFT JOIN competition_registrations
        ON competition_registrations.competition_id = competitions.id
       AND competition_registrations.status = 'registered'
@@ -2421,4 +3926,801 @@ export async function listCoachSessions(coachUserId) {
     },
     students: parseJsonColumn(row.students),
   }));
+}
+
+// ── Padel Places & Terrains ─────────────────────────────────────────────────
+
+const sanitizePadelPlace = (row) => ({
+  id: row.id,
+  name: row.name,
+  slug: row.slug,
+  location: row.location,
+  description: row.description ?? null,
+  city: row.city ?? null,
+  region: row.region ?? null,
+  address: row.address ?? null,
+  phone: row.phone ?? null,
+  website: row.website ?? null,
+  instagram: row.instagram ?? null,
+  facebook: row.facebook ?? null,
+  openingHours: parseJsonColumn(row.opening_hours),
+  amenities: parseJsonColumn(row.amenities),
+  heroImageUrl: row.hero_image_url ?? null,
+  galleryImages: parseJsonColumn(row.gallery_images),
+  hasPadel: Boolean(row.has_padel),
+  isActive: row.is_active !== false,
+  terrainCount: Number(row.terrain_count ?? 0),
+  hasIndoor: Boolean(row.has_indoor),
+  hasOutdoor: Boolean(row.has_outdoor),
+  createdAt: toIso(row.created_at),
+});
+
+const sanitizePadelTerrain = (row) => ({
+  id: row.id,
+  arenaId: row.arena_id,
+  arenaName: row.arena_name ?? null,
+  name: row.name,
+  sport: row.sport,
+  status: row.status,
+  courtType: row.court_type ?? "indoor",
+  surfaceType: row.surface_type ?? null,
+  hasLighting: row.has_lighting !== false,
+  isPanoramic: Boolean(row.is_panoramic),
+  pricePerHour: row.price_per_hour != null ? Number(row.price_per_hour) : null,
+  currency: row.currency ?? "TND",
+  imageUrl: row.image_url ?? null,
+  hasSumma: Boolean(row.has_summa),
+  minPlayers: Number(row.min_players ?? 2),
+  maxPlayers: Number(row.max_players ?? 4),
+  openingTime: String(row.opening_time ?? "").slice(0, 5),
+  closingTime: String(row.closing_time ?? "").slice(0, 5),
+  description: row.description ?? null,
+  createdAt: toIso(row.created_at),
+});
+
+export async function listArenasForCoachBooking() {
+  const { rows } = await pool.query(
+    `SELECT
+       a.*,
+       COUNT(c.id)::int AS terrain_count,
+       COALESCE(bool_or(c.court_type = 'indoor'), false) AS has_indoor,
+       COALESCE(bool_or(c.court_type IN ('outdoor', 'semi_covered')), false) AS has_outdoor
+     FROM arenas a
+     LEFT JOIN courts c ON c.arena_id = a.id
+     GROUP BY a.id
+     ORDER BY a.name ASC`
+  );
+  return rows.map(sanitizePadelPlace);
+}
+
+export async function listPadelPlaces({ city, region, search, indoor, outdoor } = {}) {
+  const params = [];
+  const conditions = ["a.has_padel = true", "a.is_active = true"];
+
+  if (city) {
+    params.push(`%${String(city).toLowerCase()}%`);
+    conditions.push(`LOWER(COALESCE(a.city, '')) LIKE $${params.length}`);
+  }
+  if (region) {
+    params.push(`%${String(region).toLowerCase()}%`);
+    conditions.push(`LOWER(COALESCE(a.region, '')) LIKE $${params.length}`);
+  }
+  if (search) {
+    params.push(`%${String(search).toLowerCase()}%`);
+    const idx = params.length;
+    conditions.push(`(LOWER(a.name) LIKE $${idx} OR LOWER(COALESCE(a.city, '')) LIKE $${idx} OR LOWER(COALESCE(a.description, '')) LIKE $${idx})`);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const { rows } = await pool.query(
+    `SELECT
+       a.*,
+       COUNT(c.id)::int AS terrain_count,
+       COALESCE(bool_or(c.court_type = 'indoor'), false) AS has_indoor,
+       COALESCE(bool_or(c.court_type IN ('outdoor', 'semi_covered')), false) AS has_outdoor
+     FROM arenas a
+     LEFT JOIN courts c ON c.arena_id = a.id
+     ${where}
+     GROUP BY a.id
+     ORDER BY a.name ASC`,
+    params
+  );
+
+  let places = rows.map(sanitizePadelPlace);
+  if (indoor === "true" || indoor === true) places = places.filter((p) => p.hasIndoor);
+  if (outdoor === "true" || outdoor === true) places = places.filter((p) => p.hasOutdoor);
+  return places;
+}
+
+export async function getPadelPlace(idOrSlug) {
+  const isNumeric = !Number.isNaN(Number(idOrSlug)) && String(idOrSlug).trim() !== "";
+  const condition = isNumeric ? "a.id = $1" : "a.slug = $1";
+  const param = isNumeric ? Number(idOrSlug) : String(idOrSlug);
+
+  const { rows } = await pool.query(
+    `SELECT
+       a.*,
+       COUNT(c.id)::int AS terrain_count,
+       COALESCE(bool_or(c.court_type = 'indoor'), false) AS has_indoor,
+       COALESCE(bool_or(c.court_type IN ('outdoor', 'semi_covered')), false) AS has_outdoor
+     FROM arenas a
+     LEFT JOIN courts c ON c.arena_id = a.id
+     WHERE ${condition} AND a.has_padel = true
+     GROUP BY a.id
+     LIMIT 1`,
+    [param]
+  );
+  return rows[0] ? sanitizePadelPlace(rows[0]) : null;
+}
+
+export async function listPadelTerrains(placeId) {
+  const { rows } = await pool.query(
+    `SELECT c.*, a.name AS arena_name
+     FROM courts c
+     JOIN arenas a ON a.id = c.arena_id
+     WHERE c.arena_id = $1
+     ORDER BY c.id ASC`,
+    [Number(placeId)]
+  );
+  return rows.map(sanitizePadelTerrain);
+}
+
+export async function getPadelTerrain(terrainId) {
+  const { rows } = await pool.query(
+    `SELECT c.*, a.name AS arena_name
+     FROM courts c
+     JOIN arenas a ON a.id = c.arena_id
+     WHERE c.id = $1
+     LIMIT 1`,
+    [Number(terrainId)]
+  );
+  return rows[0] ? sanitizePadelTerrain(rows[0]) : null;
+}
+
+export async function getPadelAvailability(placeId, date, startTime, durationMinutes) {
+  const terrains = await listPadelTerrains(placeId);
+  const dur = Number(durationMinutes) || 90;
+  const startM = startTime ? timeToMinutes(startTime) : null;
+  const endM = startM !== null ? startM + dur : null;
+  const endTime = endM !== null ? minutesToTime(endM) : null;
+
+  return Promise.all(
+    terrains.map(async (terrain) => {
+      if (terrain.status === "maintenance") return { ...terrain, available: false, availabilityReason: "maintenance" };
+
+      if (startM !== null && endM !== null) {
+        const openM = timeToMinutes(terrain.openingTime);
+        const closeM = timeToMinutes(terrain.closingTime);
+        if (openM !== null && startM < openM) return { ...terrain, available: false, availabilityReason: "before_opening" };
+        if (closeM !== null && endM > closeM) return { ...terrain, available: false, availabilityReason: "after_closing" };
+
+        if (date) {
+          const conflict = await hasReservationConflict(terrain.id, date, startTime, endTime, pool);
+          if (conflict) return { ...terrain, available: false, availabilityReason: "reserved" };
+        }
+      }
+
+      return { ...terrain, available: true, availabilityReason: "available" };
+    })
+  );
+}
+
+export async function createPadelReservation({ userId, courtId, reservationDate, startTime, durationMinutes = 90 }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows: userRows } = await client.query(
+      "SELECT id, status FROM users WHERE id = $1 LIMIT 1",
+      [Number(userId)]
+    );
+    const user = userRows[0];
+    if (!user) throw new Error("User not found");
+    if (user.status !== "active") throw new Error("This account is inactive");
+
+    const court = await getCourtByIdInternal(Number(courtId), client);
+    if (!court) throw new Error("Court not found");
+    if (court.status === "maintenance") throw new Error("This court is under maintenance");
+
+    const startM = timeToMinutes(startTime);
+    if (startM === null) throw new Error("Invalid start time");
+    const dur = Number(durationMinutes);
+    if (!dur || dur < 30 || dur > 360) throw new Error("Duration must be between 30 and 360 minutes");
+    const endM = startM + dur;
+    const endTime = minutesToTime(endM);
+
+    const openM = timeToMinutes(String(court.opening_time ?? "").slice(0, 5));
+    const closeM = timeToMinutes(String(court.closing_time ?? "").slice(0, 5));
+    if (openM !== null && startM < openM) throw new Error(`This court opens at ${String(court.opening_time).slice(0, 5)}`);
+    if (closeM !== null && endM > closeM) throw new Error(`This court closes at ${String(court.closing_time).slice(0, 5)}`);
+
+    if (await hasReservationConflict(Number(courtId), reservationDate, startTime, endTime, client)) {
+      throw new Error("This time slot is already reserved");
+    }
+
+    const qrToken = randomUUID();
+    const { rows: resRows } = await client.query(
+      `INSERT INTO reservations (user_id, court_id, reservation_date, start_time, end_time, status, qr_token, notes, created_at)
+       VALUES ($1, $2, $3::date, $4::time, $5::time, 'confirmed', $6, '', NOW())
+       RETURNING *`,
+      [Number(userId), Number(courtId), reservationDate, startTime, endTime, qrToken]
+    );
+    const reservation = resRows[0];
+
+    await client.query(
+      `INSERT INTO reservation_participants (reservation_id, user_id, created_at) VALUES ($1, $2, NOW())`,
+      [reservation.id, Number(userId)]
+    );
+
+    await client.query("COMMIT");
+    return {
+      id: reservation.id,
+      courtId: court.id,
+      courtName: court.name,
+      arenaName: court.arena_name,
+      reservationDate,
+      startTime,
+      endTime,
+      status: "confirmed",
+      qrToken,
+      createdAt: toIso(reservation.created_at),
+    };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COACHING SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const parseJsonbArray = (val) => {
+  if (Array.isArray(val)) return val;
+  if (!val) return [];
+  try { return JSON.parse(String(val)); } catch { return []; }
+};
+
+function normalizeCoachProfile(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    arenaId: row.arena_id,
+    arenaName: row.arena_name ?? null,
+    arenaCity: row.arena_city ?? null,
+    arenaRegion: row.arena_region ?? null,
+    firstName: row.first_name ?? null,
+    lastName: row.last_name ?? null,
+    email: row.email ?? null,
+    profileImageUrl: row.profile_image_url ?? null,
+    headline: row.headline ?? null,
+    bio: row.bio ?? null,
+    expertise: parseJsonbArray(row.expertise),
+    qualities: parseJsonbArray(row.qualities),
+    certifications: parseJsonbArray(row.certifications),
+    previousWorkplaces: parseJsonbArray(row.previous_workplaces),
+    languages: parseJsonbArray(row.languages),
+    yearsExperience: row.years_experience ?? null,
+    hourlyRate: row.hourly_rate ? Number(row.hourly_rate) : null,
+    currency: row.currency ?? "TND",
+    isActive: row.is_active ?? true,
+    isVerified: row.is_verified ?? false,
+    maxSessionsPerDay: row.max_sessions_per_day ?? null,
+    sessionDurationMinutes: row.session_duration_minutes ?? 60,
+    cooldownMinutes: row.cooldown_minutes ?? 0,
+    userStatus: row.user_status ?? null,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
+function normalizeCoachingRequest(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    playerUserId: row.player_user_id,
+    playerName: row.player_name ?? null,
+    coachUserId: row.coach_user_id,
+    coachName: row.coach_name ?? null,
+    arenaId: row.arena_id,
+    arenaName: row.arena_name ?? null,
+    arenaCity: row.arena_city ?? null,
+    courtName: row.court_name ?? null,
+    courtType: row.court_type ?? null,
+    surfaceType: row.surface_type ?? null,
+    coachHeadline: row.coach_headline ?? null,
+    coachHourlyRate: row.coach_hourly_rate ? Number(row.coach_hourly_rate) : null,
+    requestedDate: row.requested_date ? String(row.requested_date).slice(0, 10) : null,
+    requestedStartTime: row.requested_start_time ? String(row.requested_start_time).slice(0, 5) : null,
+    requestedEndTime: row.requested_end_time ? String(row.requested_end_time).slice(0, 5) : null,
+    playersCount: row.players_count,
+    message: row.message ?? null,
+    status: row.status,
+    coachReplyMessage: row.coach_reply_message ?? null,
+    counterProposedDate: row.counter_proposed_date ? String(row.counter_proposed_date).slice(0, 10) : null,
+    counterProposedStartTime: row.counter_proposed_start_time ? String(row.counter_proposed_start_time).slice(0, 5) : null,
+    counterProposedEndTime: row.counter_proposed_end_time ? String(row.counter_proposed_end_time).slice(0, 5) : null,
+    paymentStatus: row.payment_status ?? "pending",
+    reservationId: row.coaching_reservation_id ?? null,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
+function normalizeCoachingSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    coachingRequestId: row.coaching_request_id,
+    playerUserId: row.player_user_id,
+    playerName: row.player_name ?? null,
+    coachUserId: row.coach_user_id,
+    coachName: row.coach_name ?? null,
+    arenaId: row.arena_id,
+    arenaName: row.arena_name ?? null,
+    sessionDate: row.session_date ? String(row.session_date).slice(0, 10) : null,
+    startTime: row.start_time ? String(row.start_time).slice(0, 5) : null,
+    endTime: row.end_time ? String(row.end_time).slice(0, 5) : null,
+    playersCount: row.players_count,
+    status: row.status,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
+// ── Coach Profiles ────────────────────────────────────────────────────────────
+
+export async function getCoachProfile(coachUserId) {
+  const { rows } = await pool.query(
+    `SELECT cp.*, u.first_name, u.last_name, u.email, u.status AS user_status,
+            a.name AS arena_name, a.city AS arena_city
+     FROM users u
+     LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+     LEFT JOIN arenas a ON a.id = cp.arena_id
+     WHERE u.id = $1`,
+    [Number(coachUserId)]
+  );
+  return normalizeCoachProfile(rows[0]);
+}
+
+export async function upsertCoachProfile(actorUserId, targetCoachUserId, data) {
+  const actor = await requireActiveActor(actorUserId);
+  const isSelf = Number(actorUserId) === Number(targetCoachUserId);
+  if (!isSelf && !isAdminLike(actor)) throw new Error("Not allowed to edit this coach profile");
+
+  const {
+    arenaId, profileImageUrl, headline, bio,
+    expertise, qualities, certifications, previousWorkplaces,
+    languages, yearsExperience, hourlyRate, currency, isActive, isVerified,
+    maxSessionsPerDay, sessionDurationMinutes, cooldownMinutes,
+  } = data;
+
+  const safeArenaId = arenaId !== undefined ? (arenaId ? Number(arenaId) : null) : (actor.arena_id ?? null);
+  const existing = await pool.query("SELECT id FROM coach_profiles WHERE user_id = $1", [Number(targetCoachUserId)]);
+
+  if (existing.rows[0]) {
+    const fields = [];
+    const params = [];
+    const set = (col, val) => { fields.push(`${col} = $${params.length + 1}`); params.push(val); };
+    if (arenaId !== undefined) set("arena_id", safeArenaId);
+    if (profileImageUrl !== undefined) set("profile_image_url", profileImageUrl);
+    if (headline !== undefined) set("headline", String(headline || "").trim() || null);
+    if (bio !== undefined) set("bio", String(bio || "").trim() || null);
+    if (expertise !== undefined) set("expertise", JSON.stringify(Array.isArray(expertise) ? expertise : []));
+    if (qualities !== undefined) set("qualities", JSON.stringify(Array.isArray(qualities) ? qualities : []));
+    if (certifications !== undefined) set("certifications", JSON.stringify(Array.isArray(certifications) ? certifications : []));
+    if (previousWorkplaces !== undefined) set("previous_workplaces", JSON.stringify(Array.isArray(previousWorkplaces) ? previousWorkplaces : []));
+    if (languages !== undefined) set("languages", JSON.stringify(Array.isArray(languages) ? languages : []));
+    if (yearsExperience !== undefined) set("years_experience", yearsExperience ? Number(yearsExperience) : null);
+    if (hourlyRate !== undefined) set("hourly_rate", hourlyRate ? Number(hourlyRate) : null);
+    if (currency !== undefined) set("currency", String(currency || "TND").trim());
+    if (isActive !== undefined && isAdminLike(actor)) set("is_active", Boolean(isActive));
+    if (isVerified !== undefined && isAdminLike(actor)) set("is_verified", Boolean(isVerified));
+    if (maxSessionsPerDay !== undefined) set("max_sessions_per_day", maxSessionsPerDay !== null ? Math.max(1, Number(maxSessionsPerDay)) : null);
+    if (sessionDurationMinutes !== undefined) set("session_duration_minutes", Math.max(15, Number(sessionDurationMinutes) || 60));
+    if (cooldownMinutes !== undefined) set("cooldown_minutes", Math.max(0, Number(cooldownMinutes) || 0));
+    fields.push("updated_at = NOW()");
+    if (!params.length) return getCoachProfile(targetCoachUserId);
+    params.push(Number(targetCoachUserId));
+    await pool.query(`UPDATE coach_profiles SET ${fields.join(", ")} WHERE user_id = $${params.length}`, params);
+  } else {
+    await pool.query(
+      `INSERT INTO coach_profiles
+         (user_id, arena_id, profile_image_url, headline, bio, expertise, qualities,
+          certifications, previous_workplaces, languages, years_experience, hourly_rate,
+          currency, is_active, is_verified)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [
+        Number(targetCoachUserId), safeArenaId,
+        profileImageUrl ?? null,
+        headline ? String(headline).trim() : null,
+        bio ? String(bio).trim() : null,
+        JSON.stringify(Array.isArray(expertise) ? expertise : []),
+        JSON.stringify(Array.isArray(qualities) ? qualities : []),
+        JSON.stringify(Array.isArray(certifications) ? certifications : []),
+        JSON.stringify(Array.isArray(previousWorkplaces) ? previousWorkplaces : []),
+        JSON.stringify(Array.isArray(languages) ? languages : []),
+        yearsExperience ? Number(yearsExperience) : null,
+        hourlyRate ? Number(hourlyRate) : null,
+        String(currency || "TND").trim(),
+        isActive !== undefined ? Boolean(isActive) : true,
+        isVerified !== undefined ? Boolean(isVerified) : false,
+      ]
+    );
+  }
+  return getCoachProfile(targetCoachUserId);
+}
+
+export async function updateCoachAvatar(coachUserId, imageUrl) {
+  await pool.query(
+    `INSERT INTO coach_profiles (user_id, profile_image_url)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET profile_image_url = $2, updated_at = NOW()`,
+    [Number(coachUserId), imageUrl]
+  );
+}
+
+export async function listCoachProfiles(filters = {}) {
+  const { arenaId, city, search } = filters;
+  const params = [];
+  const where = ["u.role = 'coach'", "u.status = 'active'"];
+  if (arenaId) { params.push(Number(arenaId)); where.push(`cp.arena_id = $${params.length}`); }
+  if (city) { params.push(`%${city}%`); where.push(`a.city ILIKE $${params.length}`); }
+  if (search) {
+    params.push(`%${search}%`);
+    const idx = params.length;
+    where.push(`(u.first_name ILIKE $${idx} OR u.last_name ILIKE $${idx} OR cp.headline ILIKE $${idx} OR a.name ILIKE $${idx} OR a.city ILIKE $${idx} OR a.region ILIKE $${idx})`);
+  }
+  const { rows } = await pool.query(
+    `SELECT cp.*, u.first_name, u.last_name, u.email, u.status AS user_status,
+            a.name AS arena_name, a.city AS arena_city, a.region AS arena_region
+     FROM users u
+     LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+     LEFT JOIN arenas a ON a.id = cp.arena_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY cp.is_verified DESC NULLS LAST, u.first_name ASC`,
+    params
+  );
+  let result = rows.map(normalizeCoachProfile);
+  const { expertise, language } = filters;
+  if (expertise) {
+    const exp = expertise.toLowerCase();
+    result = result.filter((c) => c.expertise.some((e) => String(e).toLowerCase().includes(exp)));
+  }
+  if (language) {
+    const lang = language.toLowerCase();
+    result = result.filter((c) => c.languages.some((l) => String(l).toLowerCase().includes(lang)));
+  }
+  return result;
+}
+
+export async function getCoachPublicProfile(coachUserId) {
+  const { rows } = await pool.query(
+    `SELECT cp.*, u.first_name, u.last_name, u.email, u.status AS user_status,
+            a.name AS arena_name, a.city AS arena_city, a.region AS arena_region
+     FROM users u
+     LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+     LEFT JOIN arenas a ON a.id = cp.arena_id
+     WHERE u.id = $1 AND u.role = 'coach' AND u.status = 'active'`,
+    [Number(coachUserId)]
+  );
+  return normalizeCoachProfile(rows[0] ?? null);
+}
+
+// ── Availability ──────────────────────────────────────────────────────────────
+
+export async function getCoachAvailability(coachUserId) {
+  const [rulesRes, excRes, profileRes] = await Promise.all([
+    pool.query(
+      `SELECT * FROM coach_availability_rules WHERE coach_user_id = $1 ORDER BY day_of_week, start_time`,
+      [Number(coachUserId)]
+    ),
+    pool.query(
+      `SELECT * FROM coach_availability_exceptions WHERE coach_user_id = $1 AND exception_date >= CURRENT_DATE ORDER BY exception_date`,
+      [Number(coachUserId)]
+    ),
+    pool.query(
+      `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+      [Number(coachUserId)]
+    ),
+  ]);
+  const p = profileRes.rows[0];
+  return {
+    rules: rulesRes.rows.map((r) => ({
+      id: r.id, dayOfWeek: r.day_of_week,
+      startTime: String(r.start_time).slice(0, 5),
+      endTime: String(r.end_time).slice(0, 5),
+      isAvailable: r.is_available,
+    })),
+    exceptions: excRes.rows.map((r) => ({
+      id: r.id, date: String(r.exception_date).slice(0, 10),
+      startTime: r.start_time ? String(r.start_time).slice(0, 5) : null,
+      endTime: r.end_time ? String(r.end_time).slice(0, 5) : null,
+      isAvailable: r.is_available, reason: r.reason ?? null,
+    })),
+    sessionLimits: {
+      maxSessionsPerDay: p?.max_sessions_per_day ?? null,
+      sessionDurationMinutes: p?.session_duration_minutes ?? 60,
+      cooldownMinutes: p?.cooldown_minutes ?? 0,
+    },
+  };
+}
+
+export async function setCoachAvailabilityRules(coachUserId, rules) {
+  const actor = await requireActiveActor(coachUserId);
+  if (!isCoachLike(actor)) throw new Error("Coach access required");
+  if (!Array.isArray(rules)) throw new Error("rules must be an array");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM coach_availability_rules WHERE coach_user_id = $1", [actor.id]);
+    for (const rule of rules) {
+      const dow = Number(rule.dayOfWeek);
+      if (dow < 0 || dow > 6 || !rule.startTime || !rule.endTime) continue;
+      await client.query(
+        `INSERT INTO coach_availability_rules (coach_user_id, arena_id, day_of_week, start_time, end_time, is_available)
+         VALUES ($1, $2, $3, $4::time, $5::time, $6)`,
+        [actor.id, actor.arena_id ?? null, dow, rule.startTime, rule.endTime, rule.isAvailable !== false]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+  return getCoachAvailability(coachUserId);
+}
+
+export async function addCoachAvailabilityException(coachUserId, { date, startTime, endTime, isAvailable, reason }) {
+  const actor = await requireActiveActor(coachUserId);
+  if (!isCoachLike(actor)) throw new Error("Coach access required");
+  if (!date) throw new Error("date is required");
+  await pool.query(
+    `INSERT INTO coach_availability_exceptions (coach_user_id, exception_date, start_time, end_time, is_available, reason)
+     VALUES ($1, $2::date, $3, $4, $5, $6)`,
+    [actor.id, date, startTime ?? null, endTime ?? null, isAvailable !== false, String(reason ?? "").trim() || null]
+  );
+  return getCoachAvailability(coachUserId);
+}
+
+export async function getCoachAvailableSlots(coachUserId, date) {
+  if (!date) throw new Error("date is required");
+  const d = new Date(date + "T00:00:00Z");
+  const dow = d.getUTCDay();
+  const [rulesRes, excRes, sessRes, profileRes] = await Promise.all([
+    pool.query(
+      `SELECT start_time, end_time FROM coach_availability_rules
+       WHERE coach_user_id = $1 AND day_of_week = $2 AND is_available = true ORDER BY start_time`,
+      [Number(coachUserId), dow]
+    ),
+    pool.query(
+      `SELECT is_available, start_time, end_time FROM coach_availability_exceptions
+       WHERE coach_user_id = $1 AND exception_date = $2::date`,
+      [Number(coachUserId), date]
+    ),
+    pool.query(
+      `SELECT start_time, end_time FROM coaching_sessions
+       WHERE coach_user_id = $1 AND session_date = $2::date AND status = 'scheduled'`,
+      [Number(coachUserId), date]
+    ),
+    pool.query(
+      `SELECT max_sessions_per_day, session_duration_minutes, cooldown_minutes FROM coach_profiles WHERE user_id = $1`,
+      [Number(coachUserId)]
+    ),
+  ]);
+  const p = profileRes.rows[0];
+  const SLOT = Math.max(15, Number(p?.session_duration_minutes) || 60);
+  const maxPerDay = p?.max_sessions_per_day ? Number(p.max_sessions_per_day) : null;
+  const cooldown = Math.max(0, Number(p?.cooldown_minutes) || 0);
+
+  if (maxPerDay !== null && sessRes.rows.length >= maxPerDay) return [];
+
+  let baseSlots;
+  if (excRes.rows.length > 0) {
+    const exc = excRes.rows[0];
+    if (!exc.is_available) return [];
+    baseSlots = exc.start_time && exc.end_time ? [exc] : rulesRes.rows;
+  } else {
+    baseSlots = rulesRes.rows;
+  }
+  if (!baseSlots.length) return [];
+
+  const booked = sessRes.rows.map((s) => ({
+    start: timeToMinutes(String(s.start_time).slice(0, 5)),
+    end: timeToMinutes(String(s.end_time).slice(0, 5)) + cooldown,
+  }));
+  const slots = [];
+  for (const base of baseSlots) {
+    const sm = timeToMinutes(String(base.start_time).slice(0, 5));
+    const em = timeToMinutes(String(base.end_time).slice(0, 5));
+    if (sm === null || em === null) continue;
+    for (let t = sm; t + SLOT <= em; t += SLOT) {
+      const te = t + SLOT;
+      if (!booked.some((b) => t < b.end && te > b.start)) {
+        slots.push({ start: minutesToTime(t), end: minutesToTime(te) });
+      }
+    }
+  }
+  return slots;
+}
+
+// ── Coaching Requests ─────────────────────────────────────────────────────────
+
+export async function createCoachingRequest(playerUserId, {
+  coachUserId, arenaId, requestedDate, requestedStartTime,
+  requestedEndTime, playersCount, message, preferredCourtId,
+}) {
+  const player = await requireActiveActor(playerUserId);
+  const pc = Number(playersCount) || 1;
+  if (pc < 1 || pc > 4) throw new Error("playersCount must be between 1 and 4");
+  if (!requestedDate || !requestedStartTime || !requestedEndTime) throw new Error("Date and times are required");
+  const slots = await getCoachAvailableSlots(Number(coachUserId), requestedDate);
+  if (!slots.find((s) => s.start === requestedStartTime.slice(0, 5))) {
+    throw new Error("The requested time slot is not available for this coach");
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO coaching_requests
+       (player_user_id, coach_user_id, arena_id, requested_date, requested_start_time,
+        requested_end_time, players_count, message, preferred_court_id)
+     VALUES ($1,$2,$3,$4::date,$5::time,$6::time,$7,$8,$9) RETURNING *`,
+    [player.id, Number(coachUserId), arenaId ? Number(arenaId) : null,
+     requestedDate, requestedStartTime, requestedEndTime, pc, String(message ?? "").trim() || null,
+     preferredCourtId ? Number(preferredCourtId) : null]
+  );
+  const req = rows[0];
+  try {
+    const coachUser = await findUserById(Number(coachUserId));
+    if (coachUser) {
+      await createNotification({
+        userId: coachUser.id,
+        title: "New coaching request",
+        body: `${player.first_name} ${player.last_name} requested a session on ${requestedDate} at ${requestedStartTime.slice(0, 5)}`,
+        type: "coaching_request_created",
+        linkUrl: "/coach/requests",
+      });
+    }
+  } catch (_) { /* non-critical */ }
+  return normalizeCoachingRequest({ ...req, player_name: `${player.first_name} ${player.last_name}` });
+}
+
+export async function respondToCoachingRequest(coachUserId, requestId, {
+  action, message, counterProposedDate, counterProposedStartTime, counterProposedEndTime,
+}) {
+  const coach = await requireActiveActor(coachUserId);
+  if (!isCoachLike(coach)) throw new Error("Coach access required");
+  const { rows } = await pool.query("SELECT * FROM coaching_requests WHERE id = $1", [Number(requestId)]);
+  const req = rows[0];
+  if (!req) throw new Error("Request not found");
+  if (Number(req.coach_user_id) !== Number(coach.id)) throw new Error("This request is not for you");
+  if (req.status !== "pending") throw new Error("Only pending requests can be responded to");
+  const validActions = ["accept", "reject", "counter_propose"];
+  if (!validActions.includes(action)) throw new Error("Invalid action");
+  let newStatus;
+  let session = null;
+  if (action === "accept") {
+    newStatus = "accepted";
+    const { rows: sr } = await pool.query(
+      `INSERT INTO coaching_sessions
+         (coaching_request_id, player_user_id, coach_user_id, arena_id, session_date,
+          start_time, end_time, players_count)
+       VALUES ($1,$2,$3,$4,$5::date,$6::time,$7::time,$8) RETURNING *`,
+      [req.id, req.player_user_id, req.coach_user_id, req.arena_id,
+       req.requested_date, req.requested_start_time, req.requested_end_time, req.players_count]
+    );
+    session = sr[0];
+    try { await createNotification({ userId: req.player_user_id, title: "Coaching request accepted", body: `${coach.first_name} ${coach.last_name} accepted your session for ${String(req.requested_date).slice(0, 10)}`, type: "coaching_request_accepted", linkUrl: "/coaching-requests" }); } catch (_) {}
+  } else if (action === "reject") {
+    newStatus = "rejected";
+    try { await createNotification({ userId: req.player_user_id, title: "Coaching request declined", body: `${coach.first_name} ${coach.last_name} declined your session request`, type: "coaching_request_rejected", linkUrl: "/coaching-requests" }); } catch (_) {}
+  } else {
+    if (!counterProposedDate || !counterProposedStartTime || !counterProposedEndTime) throw new Error("Counter-proposal requires date and times");
+    newStatus = "counter_proposed";
+    try { await createNotification({ userId: req.player_user_id, title: "Coach proposed another time", body: `${coach.first_name} ${coach.last_name} proposed ${counterProposedDate} at ${counterProposedStartTime}`, type: "coaching_request_counter_proposed", linkUrl: "/coaching-requests" }); } catch (_) {}
+  }
+  const { rows: updated } = await pool.query(
+    `UPDATE coaching_requests SET status=$1, coach_reply_message=$2,
+       counter_proposed_date=$3, counter_proposed_start_time=$4, counter_proposed_end_time=$5,
+       updated_at=NOW() WHERE id=$6 RETURNING *`,
+    [newStatus, String(message ?? "").trim() || null,
+     action === "counter_propose" ? counterProposedDate : null,
+     action === "counter_propose" ? counterProposedStartTime : null,
+     action === "counter_propose" ? counterProposedEndTime : null,
+     req.id]
+  );
+  return { request: normalizeCoachingRequest(updated[0]), session: session ? normalizeCoachingSession(session) : null };
+}
+
+export async function listCoachingRequestsForCoach(coachUserId) {
+  const { rows } = await pool.query(
+    `SELECT cr.*, CONCAT(p.first_name,' ',p.last_name) AS player_name,
+       CONCAT(c.first_name,' ',c.last_name) AS coach_name, a.name AS arena_name
+     FROM coaching_requests cr
+     JOIN users p ON p.id = cr.player_user_id
+     JOIN users c ON c.id = cr.coach_user_id
+     LEFT JOIN arenas a ON a.id = cr.arena_id
+     WHERE cr.coach_user_id = $1 ORDER BY cr.created_at DESC`,
+    [Number(coachUserId)]
+  );
+  return rows.map(normalizeCoachingRequest);
+}
+
+export async function listCoachingRequestsForPlayer(playerUserId) {
+  const { rows } = await pool.query(
+    `SELECT cr.*, CONCAT(p.first_name,' ',p.last_name) AS player_name,
+       CONCAT(c.first_name,' ',c.last_name) AS coach_name,
+       a.name AS arena_name, a.city AS arena_city,
+       court.name AS court_name, court.court_type, court.surface_type,
+       cp.headline AS coach_headline, cp.hourly_rate AS coach_hourly_rate
+     FROM coaching_requests cr
+     JOIN users p ON p.id = cr.player_user_id
+     JOIN users c ON c.id = cr.coach_user_id
+     LEFT JOIN arenas a ON a.id = cr.arena_id
+     LEFT JOIN courts court ON court.id = cr.preferred_court_id
+     LEFT JOIN coach_profiles cp ON cp.user_id = cr.coach_user_id
+     WHERE cr.player_user_id = $1 ORDER BY cr.created_at DESC`,
+    [Number(playerUserId)]
+  );
+  return rows.map(normalizeCoachingRequest);
+}
+
+export async function listCoachingSessionsForUser(userId) {
+  const actor = await requireActiveActor(userId);
+  const col = (isCoachLike(actor) && actor.effective_role !== "player") ? "coach_user_id" : "player_user_id";
+  const { rows } = await pool.query(
+    `SELECT cs.*, CONCAT(p.first_name,' ',p.last_name) AS player_name,
+       CONCAT(c.first_name,' ',c.last_name) AS coach_name, a.name AS arena_name
+     FROM coaching_sessions cs
+     JOIN users p ON p.id = cs.player_user_id
+     JOIN users c ON c.id = cs.coach_user_id
+     LEFT JOIN arenas a ON a.id = cs.arena_id
+     WHERE cs.${col} = $1
+     ORDER BY cs.session_date DESC, cs.start_time DESC`,
+    [actor.id]
+  );
+  return rows.map(normalizeCoachingSession);
+}
+
+export async function listAdminCoaches(actorUserId) {
+  const actor = await requireActiveActor(actorUserId);
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  const params = [];
+  const where = ["u.role = 'coach'"];
+  if (actor.effective_role !== "super_admin") {
+    params.push(actor.arena_id);
+    where.push(`(cp.arena_id = $${params.length} OR am.arena_id = $${params.length})`);
+  }
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (u.id) cp.*, u.first_name, u.last_name, u.email, u.status AS user_status,
+       a.name AS arena_name, a.city AS arena_city
+     FROM users u
+     LEFT JOIN coach_profiles cp ON cp.user_id = u.id
+     LEFT JOIN arenas a ON a.id = cp.arena_id
+     LEFT JOIN arena_memberships am ON am.user_id = u.id AND am.role = 'coach'
+     WHERE ${where.join(" AND ")} ORDER BY u.id, u.first_name`,
+    params
+  );
+  return rows.map((r) => ({ ...normalizeCoachProfile(r), userStatus: r.user_status }));
+}
+
+export async function assignCoachToArena(actorUserId, coachUserId, arenaId) {
+  const actor = await requireActiveActor(actorUserId);
+  if (!isAdminLike(actor)) throw new Error("Admin access required");
+  if (actor.effective_role === "admin" && Number(actor.arena_id) !== Number(arenaId)) {
+    throw new Error("You can only assign coaches to your own arena");
+  }
+  await pool.query(
+    `INSERT INTO arena_memberships (arena_id, user_id, role, status) VALUES ($1,$2,'coach','active')
+     ON CONFLICT (arena_id, user_id) DO UPDATE SET role='coach', status='active'`,
+    [Number(arenaId), Number(coachUserId)]
+  );
+  await pool.query(
+    `INSERT INTO coach_profiles (user_id, arena_id) VALUES ($1,$2)
+     ON CONFLICT (user_id) DO UPDATE SET arena_id=$2, updated_at=NOW()`,
+    [Number(coachUserId), Number(arenaId)]
+  );
 }

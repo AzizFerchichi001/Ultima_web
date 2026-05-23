@@ -1,8 +1,8 @@
 import { Component, ErrorInfo, ReactNode, lazy, Suspense, useEffect } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ArrowLeft } from "lucide-react";
 import Navbar from "./Navbar";
 import Footer from "./Footer";
-import CustomCursor from "./CustomCursor";
 
 const ThreeSceneBackground = lazy(() => import("./ThreeSceneBackground"));
 
@@ -33,89 +33,25 @@ class SceneErrorBoundary extends Component<{ children: ReactNode }, { hasError: 
   }
 }
 
+const NO_BACK = ["/", "/login", "/signup", "/about-us", "/reset-password", "/verify-email", "/payment/success", "/payment/cancel"];
+
 const Layout = ({ children }: { children: ReactNode }) => {
   const location = useLocation();
+  const navigate = useNavigate();
+  const shouldRenderScene = ["/", "/about-us"].includes(location.pathname);
+  const showBack = !NO_BACK.includes(location.pathname) && window.history.length > 1;
 
   useEffect(() => {
-    let activeCard: HTMLElement | null = null;
-    let activeUi: HTMLElement | null = null;
-
-    const onMove = (event: MouseEvent) => {
-      const nextCard = closestFromEventTarget<HTMLElement>(event.target, ".gradient-card");
-      const uiTarget = closestFromEventTarget<HTMLElement>(event.target, "button, a, [role='button']");
-
-      if (!nextCard) {
-        if (activeCard) {
-          activeCard.style.removeProperty("transform");
-          activeCard = null;
-        }
-        return;
-      }
-
-      activeCard = nextCard;
-
-      const rect = nextCard.getBoundingClientRect();
-      const x = (event.clientX - rect.left) / rect.width;
-      const y = (event.clientY - rect.top) / rect.height;
-      const rotateY = (x - 0.5) * 8;
-      const rotateX = (0.5 - y) * 8;
-
-      nextCard.style.transform = `translateY(-6px) rotateX(${rotateX.toFixed(2)}deg) rotateY(${rotateY.toFixed(2)}deg) scale(1.01)`;
-
-      if (uiTarget) {
-        activeUi = uiTarget;
-        const uiRect = uiTarget.getBoundingClientRect();
-        const ux = (event.clientX - uiRect.left) / uiRect.width - 0.5;
-        const uy = (event.clientY - uiRect.top) / uiRect.height - 0.5;
-        uiTarget.classList.add("ui-physical");
-        uiTarget.style.setProperty("translate", `${(ux * 5).toFixed(1)}px ${(uy * 5).toFixed(1)}px`);
-      } else if (activeUi) {
-        activeUi.style.removeProperty("translate");
-        activeUi.classList.remove("ui-physical");
-        activeUi = null;
-      }
-    };
-
-    const onPointerOut = (event: MouseEvent) => {
-      const card = closestFromEventTarget<HTMLElement>(event.target, ".gradient-card");
-      if (!card) return;
-      card.style.removeProperty("transform");
-      if (activeCard === card) activeCard = null;
-    };
-
-    const onClick = (event: MouseEvent) => {
-      const card = closestFromEventTarget<HTMLElement>(event.target, ".gradient-card");
-      if (!card) return;
-      card.classList.remove("surface-press");
-      requestAnimationFrame(() => card.classList.add("surface-press"));
-      window.setTimeout(() => card.classList.remove("surface-press"), 260);
-
-      const ui = closestFromEventTarget<HTMLElement>(event.target, "button, a, [role='button']");
-      if (ui) {
-        ui.classList.remove("ui-tap");
-        requestAnimationFrame(() => ui.classList.add("ui-tap"));
-        window.setTimeout(() => ui.classList.remove("ui-tap"), 220);
-      }
-    };
-
     const onPointerOutUi = (event: MouseEvent) => {
       const ui = closestFromEventTarget<HTMLElement>(event.target, "button, a, [role='button']");
       if (!ui) return;
-      ui.style.removeProperty("translate");
       ui.classList.remove("ui-physical");
-      if (activeUi === ui) activeUi = null;
     };
 
-    window.addEventListener("mousemove", onMove, { passive: true });
-    document.addEventListener("mouseout", onPointerOut);
     document.addEventListener("mouseout", onPointerOutUi);
-    document.addEventListener("click", onClick);
 
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseout", onPointerOut);
       document.removeEventListener("mouseout", onPointerOutUi);
-      document.removeEventListener("click", onClick);
     };
   }, []);
 
@@ -134,14 +70,27 @@ const Layout = ({ children }: { children: ReactNode }) => {
 
   return (
     <div className="app-shell-3d min-h-screen flex flex-col">
-      <CustomCursor />
-      <SceneErrorBoundary>
-        <Suspense fallback={null}>
-          <ThreeSceneBackground />
-        </Suspense>
-      </SceneErrorBoundary>
+      {shouldRenderScene && (
+        <SceneErrorBoundary>
+          <Suspense fallback={null}>
+            <ThreeSceneBackground />
+          </Suspense>
+        </SceneErrorBoundary>
+      )}
       <Navbar />
-      <main className="app-content-3d flex-1 pt-16" key={location.pathname}>{children}</main>
+      <main className="app-content-3d flex-1 pt-16" key={location.pathname}>
+        {showBack && (
+          <div className="max-w-7xl mx-auto px-4 pt-4">
+            <button
+              onClick={() => navigate(-1)}
+              className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft size={14} /> Back
+            </button>
+          </div>
+        )}
+        {children}
+      </main>
       <Footer />
     </div>
   );

@@ -301,13 +301,10 @@
       0 6px 18px hsl(var(--primary) / 0.12),
       inset 0 1px 0 hsl(0 0% 100% / 0.05);
     backdrop-filter: blur(14px) saturate(125%);
-    transform-style: preserve-3d;
     transition:
-      transform 300ms cubic-bezier(0.16, 1, 0.3, 1),
       border-color 300ms ease,
       box-shadow 300ms ease,
       background 300ms ease;
-    will-change: transform;
   }
 
   .gradient-card::before {
@@ -321,16 +318,11 @@
   }
 
   .gradient-card:hover {
-    transform: translateY(-6px) rotateX(3deg) rotateY(-3deg) scale(1.01);
     border-color: hsl(var(--primary) / 0.45);
     box-shadow:
       0 38px 70px hsl(245 40% 4% / 0.62),
       0 14px 26px hsl(var(--primary) / 0.25),
       inset 0 1px 0 hsl(0 0% 100% / 0.1);
-  }
-
-  .surface-press {
-    animation: surface-press 220ms ease;
   }
 
   .gradient-accent {
@@ -339,12 +331,10 @@
 
   .glow-yellow {
     box-shadow: var(--shadow-glow);
-    transform: translateZ(0);
-    transition: transform 220ms ease, box-shadow 220ms ease;
+    transition: box-shadow 220ms ease, background-color 220ms ease;
   }
 
   .glow-yellow:hover {
-    transform: translateY(-2px) scale(1.02);
     box-shadow:
       0 20px 40px hsl(var(--primary) / 0.38),
       0 6px 14px hsl(var(--primary) / 0.3);
@@ -445,28 +435,11 @@ footer {
   background: linear-gradient(180deg, hsl(var(--card) / 0.5), hsl(var(--card) / 0.78));
 }
 
-button,
-a,
-[role="button"] {
-  transform-style: preserve-3d;
-}
-
-button:hover,
-a:hover {
-  transition: transform 220ms ease, box-shadow 220ms ease;
-}
-
 .ui-physical {
   transition:
-    translate 160ms cubic-bezier(0.16, 1, 0.3, 1),
     box-shadow 200ms ease,
     filter 200ms ease;
-  will-change: translate;
   filter: saturate(1.08);
-}
-
-.ui-tap {
-  animation: ui-tap 200ms ease;
 }
 
 .cursor-aura,
@@ -476,20 +449,18 @@ a:hover {
   left: 0;
   pointer-events: none;
   z-index: 120;
-  mix-blend-mode: screen;
+  mix-blend-mode: normal;
   transform: translate3d(-100px, -100px, 0);
 }
 
 .cursor-aura {
-  width: 40px;
-  height: 40px;
-  margin-left: -20px;
-  margin-top: -20px;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  margin-top: -8px;
   border-radius: 999px;
-  border: 1px solid hsl(var(--primary) / 0.45);
-  box-shadow:
-    0 0 24px hsl(var(--primary) / 0.25),
-    inset 0 0 16px hsl(var(--primary) / 0.15);
+  border: 1px solid hsl(var(--primary) / 0.16);
+  box-shadow: none;
   transition:
     width 180ms ease,
     height 180ms ease,
@@ -499,57 +470,30 @@ a:hover {
 }
 
 .cursor-ball {
-  width: 16px;
-  height: 16px;
-  margin-left: -8px;
-  margin-top: -8px;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  margin-top: -3px;
   border-radius: 999px;
-  background:
-    radial-gradient(circle at 28% 28%, #fff58f 0%, #fff06f 38%, #dfd145 100%);
-  border: 1px solid rgb(255 255 255 / 0.65);
-  box-shadow:
-    0 0 12px rgb(255 229 105 / 0.85),
-    0 0 26px rgb(255 221 84 / 0.35);
-  transition: transform 150ms ease, filter 180ms ease, box-shadow 180ms ease;
-}
-
-.cursor-ball::before,
-.cursor-ball::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: 999px;
-}
-
-.cursor-ball::before {
-  border-left: 2px solid rgb(255 255 255 / 0.9);
-  border-right: 2px solid rgb(255 255 255 / 0.9);
-  transform: rotate(20deg) scale(0.75);
-  opacity: 0.95;
-}
-
-.cursor-ball::after {
-  background: radial-gradient(circle at 28% 28%, rgb(255 255 255 / 0.75), transparent 55%);
-  mix-blend-mode: screen;
+  background: hsl(var(--primary) / 0.9);
+  border: none;
+  box-shadow: none;
+  transition: transform 150ms ease, background 180ms ease, box-shadow 180ms ease;
 }
 
 .cursor-aura-active {
-  width: 58px;
-  height: 58px;
-  margin-left: -29px;
-  margin-top: -29px;
-  border-color: rgb(255 232 118 / 0.92);
-  box-shadow:
-    0 0 34px rgb(255 220 92 / 0.4),
-    inset 0 0 20px rgb(255 220 92 / 0.22);
+  width: 22px;
+  height: 22px;
+  margin-left: -11px;
+  margin-top: -11px;
+  border-color: hsl(var(--primary) / 0.26);
+  box-shadow: none;
 }
 
 .cursor-ball-active {
-  transform: scale(1.35);
-  filter: saturate(1.15) brightness(1.06);
-  box-shadow:
-    0 0 14px rgb(255 236 134 / 0.95),
-    0 0 30px rgb(255 227 108 / 0.45);
+  transform: scale(1.12);
+  background: hsl(var(--primary));
+  box-shadow: 0 0 0 2px hsl(var(--background) / 0.9);
 }
 
 .cursor-click {
@@ -557,10 +501,6 @@ a:hover {
 }
 
 @media (max-width: 768px) {
-  .gradient-card:hover {
-    transform: none;
-  }
-
   .three-game-hud {
     right: 12px;
     top: 76px;
@@ -575,7 +515,6 @@ a:hover {
   .glow-yellow,
   .glow-yellow:hover {
     transition: none;
-    transform: none;
   }
 
   .animate-float,
@@ -606,12 +545,6 @@ a:hover {
   to { opacity: 1; }
 }
 
-@keyframes surface-press {
-  0% { transform: translateY(-6px) scale(1.01); }
-  35% { transform: translateY(-1px) scale(0.992); }
-  100% { transform: translateY(-6px) scale(1.01); }
-}
-
 @keyframes route-cinematic-enter {
   0% {
     opacity: 0;
@@ -623,12 +556,6 @@ a:hover {
     transform: translateY(0) translateZ(0) scale(1);
     filter: blur(0);
   }
-}
-
-@keyframes ui-tap {
-  0% { transform: scale(1); }
-  45% { transform: scale(0.96); }
-  100% { transform: scale(1); }
 }
 
 @keyframes cursor-click {
@@ -686,4 +613,27 @@ a:hover {
 @keyframes counter-appear {
   from { opacity: 0; transform: translateY(20px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+.coach-week-scroll {
+  scrollbar-color: hsl(var(--foreground) / 0.45) hsl(var(--background) / 0.35);
+  scrollbar-width: thin;
+}
+
+.coach-week-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.coach-week-scroll::-webkit-scrollbar-track {
+  background: hsl(var(--background) / 0.35);
+  border-radius: 999px;
+}
+
+.coach-week-scroll::-webkit-scrollbar-thumb {
+  background: hsl(var(--foreground) / 0.45);
+  border-radius: 999px;
+}
+
+.coach-week-scroll::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--foreground) / 0.65);
 }

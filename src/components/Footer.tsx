@@ -21,7 +21,6 @@ const Footer = () => {
             <div className="flex flex-col gap-2 text-sm text-muted-foreground">
               <Link to="/reservation" className="hover:text-foreground transition-colors">{t("nav.reservation")}</Link>
               <Link to="/competitions" className="hover:text-foreground transition-colors">{t("nav.competitions")}</Link>
-              <Link to="/live-scores" className="hover:text-foreground transition-colors">{t("nav.live")}</Link>
               <Link to="/performance" className="hover:text-foreground transition-colors">{t("nav.performance")}</Link>
             </div>
           </div>

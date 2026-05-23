@@ -11,15 +11,15 @@ export default defineConfig(({ mode }) => ({
     allowedHosts: true,
     proxy: {
       "/api": {
-        target: process.env.API_URL ?? "http://localhost:3001",
+        target: process.env.API_URL ?? "http://localhost:4001",
         changeOrigin: true,
       },
       "/public": {
-        target: process.env.API_URL ?? "http://localhost:3001",
+        target: process.env.API_URL ?? "http://localhost:4001",
         changeOrigin: true,
       },
       "/socket.io": {
-        target: process.env.API_URL ?? "http://localhost:3001",
+        target: process.env.API_URL ?? "http://localhost:4001",
         ws: true,
       },
     },

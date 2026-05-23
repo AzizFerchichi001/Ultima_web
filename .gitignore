@@ -31,3 +31,4 @@ dist-ssr
 !.env.dockerdb.example
 api-logs.txt
 api-err.txt
+uploads/

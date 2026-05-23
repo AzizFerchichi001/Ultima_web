@@ -12,20 +12,19 @@ const VerifyEmail = () => {
   const [searchParams] = useSearchParams();
   const token = useMemo(() => String(searchParams.get("token") ?? ""), [searchParams]);
   const initialEmail = useMemo(() => String(searchParams.get("email") ?? "").trim().toLowerCase(), [searchParams]);
-  const [state, setState] = useState<VerifyState>("loading");
-  const [message, setMessage] = useState(token ? "Verifying your email..." : "Enter the 6-digit code sent to your email.");
+  const initialCode = useMemo(() => String(searchParams.get("code") ?? "").trim(), [searchParams]);
+  const initialDevLink = useMemo(() => String(searchParams.get("devLink") ?? "").trim(), [searchParams]);
+  const [state, setState] = useState<VerifyState>(token ? "loading" : "error");
+  const [message, setMessage] = useState(token ? "Verifying your email…" : "Enter the 6-digit code sent to your email.");
   const [verifyEmail, setVerifyEmail] = useState(initialEmail);
-  const [verifyCode, setVerifyCode] = useState("");
+  const [verifyCode, setVerifyCode] = useState(initialCode);
   const [verifyingCode, setVerifyingCode] = useState(false);
   const [resendEmail, setResendEmail] = useState(initialEmail);
   const [resending, setResending] = useState(false);
 
   useEffect(() => {
     const run = async () => {
-      if (!token) {
-        setState("error");
-        return;
-      }
+      if (!token) return;
       try {
         const result = await api<{ success: boolean; message?: string }>("/api/auth/verify-email?token=" + encodeURIComponent(token));
         setState("success");
@@ -99,6 +98,21 @@ const VerifyEmail = () => {
         <div className="w-full max-w-md gradient-card rounded-2xl border border-border p-8 animate-slide-up">
           <h1 className="text-2xl font-display font-bold mb-3">Email Verification</h1>
           <p className="text-sm text-muted-foreground">{message}</p>
+
+          {!token && initialCode && (
+            <div className="mt-4 rounded-xl border border-amber-400/40 bg-amber-500/10 p-4 text-sm text-amber-100">
+              Local dev fallback: SMTP was not configured, so the verification code is shown here.
+              <div className="mt-2 font-mono text-lg tracking-[0.35em] text-amber-50">{initialCode}</div>
+              {initialDevLink && (
+                <a
+                  href={initialDevLink}
+                  className="mt-3 inline-block text-amber-200 underline underline-offset-4 break-all"
+                >
+                  Open verification link
+                </a>
+              )}
+            </div>
+          )}
 
           {state !== "success" && (
             <div className="mt-5 rounded-xl border border-border p-4 bg-muted/20 space-y-3">

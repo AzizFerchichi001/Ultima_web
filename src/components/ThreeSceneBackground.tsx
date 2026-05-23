@@ -1,5 +1,5 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { EffectComposer, Bloom, DepthOfField, Noise, Vignette, SSAO } from "@react-three/postprocessing";
+import { EffectComposer, Bloom, Noise, Vignette } from "@react-three/postprocessing";
 import { Float, Text } from "@react-three/drei";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
@@ -671,8 +671,6 @@ const SceneRig = ({
       {quality !== "low" && (
         <EffectComposer multisampling={0}>
           <Bloom intensity={preset.bloom} mipmapBlur luminanceThreshold={0.15} />
-          <DepthOfField focusDistance={0.03} focalLength={0.035} bokehScale={quality === "high" ? 1.8 : 1.2} height={quality === "high" ? 480 : 300} />
-          {quality === "high" && <SSAO samples={8} radius={0.1} intensity={10} luminanceInfluence={0.35} color="black" />}
           <Noise opacity={quality === "high" ? 0.035 : 0.02} />
           <Vignette offset={0.16} darkness={0.7} />
         </EffectComposer>

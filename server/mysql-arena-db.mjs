@@ -43,6 +43,88 @@ const LOGO_CANDIDATE_PATHS = [
   path.resolve(__dirname, "../src/assets/ultima_logo.jpg"),
   path.resolve(__dirname, "../public/ultima_logo.jpg"),
 ];
+const SHOWCASE_ARENAS = [
+  {
+    name: "Arena Padel Premium",
+    slug: "arena-padel-premium",
+    location: "Rue du Parc, La Soukra",
+    courts: Array.from({ length: 5 }, (_, index) => ({
+      name: `Arena Court ${index + 1}`,
+      sport: "Padel",
+      status: "available",
+      has_summa: index === 4 ? 1 : 0,
+      location: "Arena Padel Premium",
+      min_players: 2,
+      max_players: 4,
+      opening_time: "08:00:00",
+      closing_time: "23:00:00",
+    })),
+  },
+  {
+    name: "Padel Indoor La Soukra",
+    slug: "padel-indoor-la-soukra",
+    location: "V6CJ+P4H, La Soukra",
+    courts: Array.from({ length: 2 }, (_, index) => ({
+      name: `Indoor Court ${index + 1}`,
+      sport: "Padel",
+      status: "available",
+      has_summa: 0,
+      location: "Padel Indoor La Soukra",
+      min_players: 2,
+      max_players: 4,
+      opening_time: "08:00:00",
+      closing_time: "22:00:00",
+    })),
+  },
+  {
+    name: "Padel House Ariana",
+    slug: "padel-house-ariana",
+    location: "676 Sidi Amor, Ariana",
+    courts: Array.from({ length: 3 }, (_, index) => ({
+      name: `House Court ${index + 1}`,
+      sport: "Padel",
+      status: "available",
+      has_summa: index === 2 ? 1 : 0,
+      location: "Padel House Ariana",
+      min_players: 2,
+      max_players: 4,
+      opening_time: "08:00:00",
+      closing_time: "23:00:00",
+    })),
+  },
+  {
+    name: "Le Club de Gammarth",
+    slug: "le-club-de-gammarth",
+    location: "Zone touristique Cap Gammarth",
+    courts: Array.from({ length: 3 }, (_, index) => ({
+      name: `Gammarth Court ${index + 1}`,
+      sport: "Padel",
+      status: "available",
+      has_summa: index === 2 ? 1 : 0,
+      location: "Le Club de Gammarth",
+      min_players: 2,
+      max_players: 4,
+      opening_time: "07:00:00",
+      closing_time: "22:00:00",
+    })),
+  },
+  {
+    name: "Olympysky Club",
+    slug: "olympysky-club",
+    location: "Lac 2, Tunis",
+    courts: Array.from({ length: 3 }, (_, index) => ({
+      name: `Sky Court ${index + 1}`,
+      sport: "Padel",
+      status: "available",
+      has_summa: index === 1 ? 1 : 0,
+      location: "Olympysky Club",
+      min_players: 2,
+      max_players: 4,
+      opening_time: "08:00:00",
+      closing_time: "22:00:00",
+    })),
+  },
+];
 
 const toIso = (value) => {
   if (!value) {
@@ -227,6 +309,42 @@ async function findUserById(userId, connection = pool) {
   return users[0] ?? null;
 }
 
+export async function getUserById(userId) {
+  return findUserById(Number(userId));
+}
+
+export async function updateUserProfile(userId, { firstName, lastName }) {
+  const fields = [];
+  const params = [];
+
+  if (firstName !== undefined) {
+    const value = String(firstName ?? "").trim();
+    if (!value) {
+      throw new Error("First name cannot be empty");
+    }
+    fields.push("first_name = ?");
+    params.push(value);
+  }
+
+  if (lastName !== undefined) {
+    const value = String(lastName ?? "").trim();
+    if (!value) {
+      throw new Error("Last name cannot be empty");
+    }
+    fields.push("last_name = ?");
+    params.push(value);
+  }
+
+  const normalizedUserId = Number(userId);
+  if (!fields.length) {
+    return findUserById(normalizedUserId);
+  }
+
+  params.push(normalizedUserId);
+  await pool.query(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, params);
+  return findUserById(normalizedUserId);
+}
+
 async function addActivityLog(connection, { arenaId = null, actorUserId = null, actorName, action, detail }) {
   await connection.query(
     `INSERT INTO activity_logs (arena_id, action, actor_user_id, actor_name, detail, created_at)
@@ -330,6 +448,33 @@ export async function initializeDatabase() {
         updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
       )`
     );
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        token VARCHAR(256) NOT NULL UNIQUE,
+        expires_at DATETIME(3) NOT NULL,
+        revoked_at DATETIME(3) NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+      )`
+    );
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS notifications (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        title VARCHAR(191) NOT NULL,
+        body TEXT NOT NULL,
+        type VARCHAR(64) NOT NULL DEFAULT 'info',
+        link_url VARCHAR(255) NULL,
+        read_at DATETIME(3) NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+      )`
+    );
+    await connection.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS uploader_user_id BIGINT NULL");
+    await connection.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS subject_user_id BIGINT NULL");
+    await connection.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS match_id BIGINT NULL");
+    await connection.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS storage_path VARCHAR(255) NULL");
+    await connection.query("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS uploaded_at DATETIME(3) NULL");
 
     await connection.query(
       `CREATE TABLE IF NOT EXISTS arena_subscriptions (
@@ -427,6 +572,57 @@ export async function initializeDatabase() {
        WHERE email_verified_at IS NULL
          AND created_at < '2026-04-12 00:00:00'`
     );
+    for (const showcaseArena of SHOWCASE_ARENAS) {
+      const [arenaRows] = await connection.query(
+        `SELECT id
+         FROM arenas
+         WHERE slug = ?
+         LIMIT 1`,
+        [showcaseArena.slug]
+      );
+
+      let arenaId = Number(arenaRows[0]?.id ?? 0);
+      if (!arenaId) {
+        const [insertArena] = await connection.query(
+          `INSERT INTO arenas (name, slug, location, created_at)
+           VALUES (?, ?, ?, NOW(3))`,
+          [showcaseArena.name, showcaseArena.slug, showcaseArena.location]
+        );
+        arenaId = Number(insertArena.insertId);
+      }
+
+      for (const court of showcaseArena.courts) {
+        const [courtRows] = await connection.query(
+          `SELECT id
+           FROM courts
+           WHERE arena_id = ?
+             AND name = ?
+           LIMIT 1`,
+          [arenaId, court.name]
+        );
+        if (courtRows[0]) {
+          continue;
+        }
+
+        await connection.query(
+          `INSERT INTO courts
+            (arena_id, name, sport, status, has_summa, location, min_players, max_players, opening_time, closing_time, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))`,
+          [
+            arenaId,
+            court.name,
+            court.sport,
+            court.status,
+            court.has_summa,
+            court.location,
+            court.min_players,
+            court.max_players,
+            court.opening_time,
+            court.closing_time,
+          ]
+        );
+      }
+    }
   } finally {
     connection.release();
   }
@@ -600,7 +796,7 @@ export async function listCourts(actor = null) {
   const params = [];
   let whereClause = "";
 
-  if (actor?.effective_role !== "super_admin" && actor?.arena_id) {
+  if (actor?.effective_role !== "super_admin" && actor?.effective_role !== "player" && actor?.arena_id) {
     whereClause = "WHERE courts.arena_id = ?";
     params.push(actor.arena_id);
   }
@@ -1215,7 +1411,7 @@ export async function createReservation({
       throw new Error("This court is not available for booking");
     }
 
-    if (creator.effective_role !== "super_admin" && court.arena_id !== creator.arena_id) {
+    if (!["player", "super_admin"].includes(creator.effective_role) && court.arena_id !== creator.arena_id) {
       throw new Error("You can only reserve courts in your arena");
     }
 
@@ -1242,35 +1438,44 @@ export async function createReservation({
       throw new Error("This slot is already reserved");
     }
 
-    const rawEmails = [creator.email, ...participantEmails].map((email) => email.trim().toLowerCase()).filter(Boolean);
-    const uniqueEmails = [...new Set(rawEmails)];
+    const guestEmails = participantEmails.map((email) => email.trim().toLowerCase()).filter(Boolean);
+    const uniqueGuestEmails = [...new Set(guestEmails)];
 
-    if (uniqueEmails.length !== rawEmails.length) {
+    if (uniqueGuestEmails.length !== guestEmails.length) {
       throw new Error("The same email cannot be used twice in a reservation");
     }
 
-    if (uniqueEmails.length < Number(court.min_players) || uniqueEmails.length > Number(court.max_players)) {
+    if (uniqueGuestEmails.some((email) => email === creator.email.toLowerCase())) {
+      throw new Error("The reservation creator is already included automatically");
+    }
+
+    const totalPlayers = 1 + uniqueGuestEmails.length;
+    if (totalPlayers < Number(court.min_players) || totalPlayers > Number(court.max_players)) {
       throw new Error(`This court accepts between ${court.min_players} and ${court.max_players} players`);
     }
 
-    const [participantRows] = await connection.query(
-      `SELECT
-         users.id,
-         users.first_name,
-         users.last_name,
-         users.email,
-         users.platform_role,
-         users.status AS account_status,
-         arena_memberships.status AS membership_status
-       FROM users
-       JOIN arena_memberships ON arena_memberships.user_id = users.id
-       WHERE arena_memberships.arena_id = ?
-         AND users.email IN (${uniqueEmails.map(() => "?").join(", ")})`,
-      [court.arena_id, ...uniqueEmails]
-    );
+    let participantRows = [];
+    if (uniqueGuestEmails.length) {
+      const [rows] = await connection.query(
+        `SELECT
+           users.id,
+           users.first_name,
+           users.last_name,
+           users.email,
+           users.platform_role,
+           users.status AS account_status,
+           arena_memberships.status AS membership_status
+         FROM users
+         JOIN arena_memberships ON arena_memberships.user_id = users.id
+         WHERE arena_memberships.arena_id = ?
+           AND users.email IN (${uniqueGuestEmails.map(() => "?").join(", ")})`,
+        [court.arena_id, ...uniqueGuestEmails]
+      );
+      participantRows = rows;
+    }
 
-    if (participantRows.length !== uniqueEmails.length) {
-      throw new Error("Every participant must already have an active account in this arena");
+    if (participantRows.length !== uniqueGuestEmails.length) {
+      throw new Error("Every guest participant must already have an active account in this venue");
     }
 
     const invalidParticipant = participantRows.find(
@@ -1281,7 +1486,7 @@ export async function createReservation({
     );
 
     if (invalidParticipant) {
-      throw new Error("Every participant must already have an active account in this arena");
+      throw new Error("Every guest participant must already have an active account in this venue");
     }
 
     const [result] = await connection.query(
@@ -1289,6 +1494,12 @@ export async function createReservation({
         (user_id, court_id, reservation_date, start_time, end_time, status, qr_token, notes, created_at)
        VALUES (?, ?, ?, ?, ?, 'confirmed', ?, ?, NOW(3))`,
       [userId, courtId, reservationDate, startTime, endTime, qrToken, notes]
+    );
+
+    await connection.query(
+      `INSERT INTO reservation_participants (reservation_id, user_id, created_at)
+       VALUES (?, ?, NOW(3))`,
+      [result.insertId, creator.id]
     );
 
     for (const participant of participantRows) {
@@ -1343,7 +1554,7 @@ export async function createReservation({
   }
 }
 
-export async function cancelReservation(id, actor) {
+export async function cancelReservation(id, actor, reason = null) {
   const connection = await pool.getConnection();
 
   try {
@@ -1413,7 +1624,7 @@ export async function cancelReservation(id, actor) {
     });
 
     await connection.commit();
-    return { changes: result.affectedRows };
+    return { changes: result.affectedRows, success: true, reservation, cancelledSession: null };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -1421,6 +1632,9 @@ export async function cancelReservation(id, actor) {
     connection.release();
   }
 }
+
+// Stub — MySQL schema does not include refund columns; noop keeps the interface consistent.
+export async function updateReservationRefund(_id, _fields) {}
 
 export async function listCompetitions(actor = null) {
   const params = [];
@@ -2449,6 +2663,79 @@ export async function updateMembershipStatus(actor, targetUserId, nextStatus) {
   }
 }
 
+export async function updateMembershipRole(actor, targetUserId, nextRole, nextArenaId = null) {
+  if (!["player", "coach", "admin"].includes(nextRole)) {
+    throw new Error("Invalid role");
+  }
+
+  if (!isAdminLike(actor)) {
+    throw new Error("Admin access required");
+  }
+
+  if (actor.id === targetUserId) {
+    throw new Error("You cannot change your own role");
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const target = await findUserById(targetUserId, connection);
+    if (!target) {
+      throw new Error("User not found");
+    }
+
+    if (target.platform_role === "super_admin") {
+      throw new Error("Super admin roles cannot be changed here");
+    }
+
+    let resolvedArenaId = nextArenaId ? Number(nextArenaId) : Number(target.arena_id);
+    if (actor.effective_role === "super_admin") {
+      if (!resolvedArenaId) throw new Error("Arena is required");
+    } else {
+      if (target.arena_id !== actor.arena_id) throw new Error("You can only manage users in your arena");
+      if (!["player", "coach"].includes(nextRole)) throw new Error("Arena admins can only assign player or coach roles");
+      if (target.membership_role === "admin") throw new Error("Only a super admin can change admin roles");
+      resolvedArenaId = Number(actor.arena_id);
+    }
+
+    if (target.membership_role === nextRole && Number(target.arena_id) === Number(resolvedArenaId)) {
+      await connection.commit();
+      return target;
+    }
+
+    await assertCanAddArenaMember(resolvedArenaId, nextRole, connection);
+
+    await connection.query("UPDATE users SET role = ? WHERE id = ?", [nextRole, targetUserId]);
+    const [membershipRows] = await connection.query("SELECT id, arena_id FROM arena_memberships WHERE user_id = ? ORDER BY id ASC", [targetUserId]);
+    const existingForArena = membershipRows.find((row) => Number(row.arena_id) === Number(resolvedArenaId));
+    const keptMembership = existingForArena ?? membershipRows[0] ?? null;
+    if (keptMembership?.id) {
+      await connection.query("UPDATE arena_memberships SET arena_id = ?, role = ?, status = 'active' WHERE id = ?", [resolvedArenaId, nextRole, keptMembership.id]);
+      await connection.query("DELETE FROM arena_memberships WHERE user_id = ? AND id <> ?", [targetUserId, keptMembership.id]);
+    } else {
+      await connection.query("INSERT INTO arena_memberships (arena_id, user_id, role, status, created_at) VALUES (?, ?, ?, 'active', NOW())", [resolvedArenaId, targetUserId, nextRole]);
+    }
+
+    await addActivityLog(connection, {
+      arenaId: resolvedArenaId,
+      actorUserId: actor.id,
+      actorName: `${actor.first_name} ${actor.last_name}`,
+      action: "Role utilisateur mis a jour",
+      detail: `${target.first_name} ${target.last_name}: ${target.membership_role} -> ${nextRole}`,
+    });
+
+    await connection.commit();
+    return findUserById(targetUserId);
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 export async function deleteUser(actor, targetUserId) {
   if (!isAdminLike(actor)) {
     throw new Error("Admin access required");
@@ -2564,26 +2851,121 @@ export async function getPerformanceForUser(userId) {
 }
 
 export async function listAnalysesForUser(userId) {
-  const [rows] = await pool.query(
-    `SELECT id, title, video_name AS videoName, status, summary, created_at AS createdAt
-     FROM ai_analyses
-     WHERE user_id = ?
-     ORDER BY created_at DESC`,
-    [userId]
-  );
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, user_id AS userId, title, video_name AS videoName, status, summary,
+              uploader_user_id AS uploaderUserId, subject_user_id AS subjectUserId, match_id AS matchId,
+              storage_path AS storagePath, uploaded_at AS uploadedAt, created_at AS createdAt
+       FROM ai_analyses
+       WHERE user_id = ? OR subject_user_id = ?
+       ORDER BY created_at DESC`,
+      [userId, userId]
+    );
 
-  return rows.map((row) => ({ ...row, createdAt: toIso(row.createdAt) }));
+    return rows.map((row) => ({ ...row, uploadedAt: toIso(row.uploadedAt), createdAt: toIso(row.createdAt) }));
+  } catch {
+    return [];
+  }
 }
 
-export async function createAnalysis({ userId, title, videoName }) {
+export async function persistRefreshToken(userId, token, expiresAt) {
+  await pool.query(
+    `INSERT INTO refresh_tokens (user_id, token, expires_at, created_at)
+     VALUES (?, ?, ?, NOW(3))`,
+    [userId, token, expiresAt]
+  );
+}
+
+export async function consumeRefreshToken(token) {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT * FROM refresh_tokens
+       WHERE token = ?
+         AND revoked_at IS NULL
+         AND expires_at > NOW(3)
+       LIMIT 1
+       FOR UPDATE`,
+      [token]
+    );
+    if (!rows[0]) {
+      await connection.rollback();
+      return null;
+    }
+    await connection.query("UPDATE refresh_tokens SET revoked_at = NOW(3) WHERE id = ?", [rows[0].id]);
+    await connection.commit();
+    return rows[0];
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+export async function revokeRefreshTokensForUser(userId) {
+  await pool.query("UPDATE refresh_tokens SET revoked_at = NOW(3) WHERE user_id = ? AND revoked_at IS NULL", [userId]);
+}
+
+export async function listNotificationsForUser(userId) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, title, body, type, link_url AS linkUrl, read_at AS readAt, created_at AS createdAt
+       FROM notifications
+       WHERE user_id = ?
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+    return rows.map((row) => ({ ...row, readAt: toIso(row.readAt), createdAt: toIso(row.createdAt) }));
+  } catch {
+    return [];
+  }
+}
+
+export async function createNotification({ userId, title, body, type = "info", linkUrl = null }) {
   const [result] = await pool.query(
-    `INSERT INTO ai_analyses (user_id, title, video_name, status, summary, created_at)
-     VALUES (?, ?, ?, 'queued', ?, NOW(3))`,
-    [userId, title, videoName, "Analyse planifiee pour le moteur SmartPlay AI."]
+    `INSERT INTO notifications (user_id, title, body, type, link_url, created_at)
+     VALUES (?, ?, ?, ?, ?, NOW(3))`,
+    [userId, title, body, type, linkUrl]
+  );
+  const [rows] = await pool.query(
+    `SELECT id, title, body, type, link_url AS linkUrl, read_at AS readAt, created_at AS createdAt
+     FROM notifications
+     WHERE id = ?`,
+    [result.insertId]
+  );
+  return rows[0] ? { ...rows[0], readAt: toIso(rows[0].readAt), createdAt: toIso(rows[0].createdAt) } : null;
+}
+
+export async function markNotificationRead(userId, notificationId) {
+  await pool.query(
+    `UPDATE notifications
+     SET read_at = COALESCE(read_at, NOW(3))
+     WHERE id = ? AND user_id = ?`,
+    [notificationId, userId]
+  );
+  const [rows] = await pool.query(
+    `SELECT id, title, body, type, link_url AS linkUrl, read_at AS readAt, created_at AS createdAt
+     FROM notifications
+     WHERE id = ? AND user_id = ?`,
+    [notificationId, userId]
+  );
+  return rows[0] ? { ...rows[0], readAt: toIso(rows[0].readAt), createdAt: toIso(rows[0].createdAt) } : null;
+}
+
+export async function createAnalysis({ userId, title, videoName, uploaderUserId = null, subjectUserId = null, matchId = null, storagePath = null, status = "queued", summary = null }) {
+  const [result] = await pool.query(
+    `INSERT INTO ai_analyses (user_id, title, video_name, status, summary, uploader_user_id, subject_user_id, match_id, storage_path, uploaded_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+    [userId, title, videoName, status, summary ?? "Analyse en attente de traitement par le module IA.", uploaderUserId ?? userId, subjectUserId ?? userId, matchId, storagePath]
   );
 
   const [rows] = await pool.query(
-    `SELECT id, title, video_name AS videoName, status, summary, created_at AS createdAt
+    `SELECT id, user_id AS userId, title, video_name AS videoName, status, summary,
+            uploader_user_id AS uploaderUserId, subject_user_id AS subjectUserId, match_id AS matchId,
+            storage_path AS storagePath, uploaded_at AS uploadedAt, created_at AS createdAt
      FROM ai_analyses
      WHERE id = ?`,
     [result.insertId]
@@ -2591,6 +2973,7 @@ export async function createAnalysis({ userId, title, videoName }) {
 
   return {
     ...rows[0],
+    uploadedAt: toIso(rows[0].uploadedAt),
     createdAt: toIso(rows[0].createdAt),
   };
 }

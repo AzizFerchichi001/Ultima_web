@@ -1,4 +1,5 @@
 const TOKEN_KEY = "ultima-demo-token";
+const REFRESH_TOKEN_KEY = "ultima-demo-refresh-token";
 const USER_KEY = "ultima-demo-user";
 
 export type SessionUser = {
@@ -24,13 +25,21 @@ export function getToken() {
   return localStorage.getItem(TOKEN_KEY);
 }
 
-export function setSession(token: string, user: SessionUser) {
+export function getRefreshToken() {
+  return localStorage.getItem(REFRESH_TOKEN_KEY);
+}
+
+export function setSession(token: string, user: SessionUser, refreshToken?: string | null) {
   localStorage.setItem(TOKEN_KEY, token);
+  if (refreshToken) {
+    localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+  }
   localStorage.setItem(USER_KEY, JSON.stringify(user));
 }
 
 export function clearSession() {
   localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
 }
 

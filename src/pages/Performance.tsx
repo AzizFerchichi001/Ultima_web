@@ -1,174 +1,299 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useLocation, useSearchParams } from "react-router-dom";
 import Layout from "@/components/Layout";
 import {
-  BarChart3, TrendingUp, Target, Flame,
-  MapPin, Trophy, ArrowRight, CheckCircle2, XCircle, Activity,
+  BarChart3, Trophy, Zap,
+  Calendar, MapPin, Clock, Users,
+  ChevronDown, Download, Smartphone, Loader2, GraduationCap,
+  Video, Play,
 } from "lucide-react";
-import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis,
-  PolarRadiusAxis, Radar,
-} from "recharts";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
-import { getSessionUser } from "@/lib/session";
+import { api, resolveApiUrl } from "@/lib/api";
+import { getSessionUser, getToken } from "@/lib/session";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
+import QRCode from "qrcode";
+import PlayerLiveSessionCard from "@/components/smartplay/PlayerLiveSessionCard";
 
-type PlayerMatch = {
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type ReservationRecord = {
+  id: number; reservation_date: string; start_time: string; end_time: string;
+  status: string; payment_status: string; court_name: string; arena_name: string;
+  arena_city?: string; court_type?: string; surface_type?: string; has_lighting?: boolean;
+  booking_type?: string; total_price?: number; amount?: number; currency?: string;
+  num_players?: number; notes?: string; created_at?: string;
+  coach_name?: string; coach_specialization?: string;
+};
+
+type CompetitionRecord = {
+  competition_id: number; name: string; sport: string; start_date: string;
+  competition_status: string; registration_status: string; arena_name: string;
+};
+
+type SmartPlayClip = {
   id: number;
-  court_name: string;
-  arena_name: string;
-  score1: number[];
-  score2: number[];
-  winner_team: number;
-  scheduled_at: string;
-  team1_player1_id: number;
-  team1_player2_id: number;
-  team2_player1_id: number;
-  team2_player2_id: number;
+  originalFilename: string;
+  sportType: string;
+  courtName: string | null;
+  playedDate: string | null;
+  playedTime: string | null;
+  durationSec: number | null;
+  sharedAt: string | null;
+  jobStatus: string | null;
+  renderedVideoPath: string | null;
 };
 
-type PerformanceResponse = {
-  summary: {
-    rankingScore: number;
-    winRate: string;
-    streak: string;
-    matchesThisMonth: number;
-    wins: number;
-    losses: number;
-  } | null;
-  progress: Array<{ semaine: string; score: number; victoires: number; defaites: number }>;
-  radar: Array<{ skill: string; value: number }>;
+// ── Section Tabs ──────────────────────────────────────────────────────────────
+
+const toCurrencyAmount = (value: unknown) => {
+  const amount = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(amount) ? amount : null;
 };
 
-/* ── Count-up component ── */
-const CountUp = ({
-  target,
-  suffix = "",
-  duration = 1200,
-}: {
-  target: number;
-  suffix?: string;
-  duration?: number;
+const sections = [
+  { id: "reservations", label: "Reservations", icon: Calendar },
+  { id: "competitions", label: "Competitions", icon: Trophy },
+  { id: "smartplay", label: "SmartPlay Videos", icon: Video },
+];
+
+// ── Expandable Reservation Card ───────────────────────────────────────────────
+
+const ReservationCard = ({ res, expanded, onToggle }: {
+  res: ReservationRecord;
+  expanded: boolean;
+  onToggle: () => void;
 }) => {
-  const [val, setVal] = useState(0);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [mobileUrl, setMobileUrl] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const isPaid = res.payment_status === "paid";
+  const isCoaching = res.booking_type === "coaching_session";
+  const price = toCurrencyAmount(res.total_price ?? res.amount);
+
   useEffect(() => {
-    let start: number | null = null;
-    let raf: number;
-    const tick = (ts: number) => {
-      if (!start) start = ts;
-      const progress = Math.min((ts - start) / duration, 1);
-      setVal(Math.floor((1 - Math.pow(1 - progress, 3)) * target));
-      if (progress < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [target, duration]);
-  return <>{val.toLocaleString()}{suffix}</>;
-};
+    if (!expanded || !isPaid) return;
+    api<{ url: string }>(`/api/reservations/${res.id}/ticket-link`, { authenticated: true })
+      .then((d) => setMobileUrl(d.url))
+      .catch(() => {});
+  }, [expanded, isPaid, res.id]);
 
-const chartGrid = "hsl(var(--border))";
-const chartBg = "hsl(var(--card))";
-const chartPrimary = "hsl(var(--primary))";
+  useEffect(() => {
+    if (!mobileUrl || !canvasRef.current) return;
+    QRCode.toCanvas(canvasRef.current, mobileUrl, {
+      width: 160, margin: 2,
+      color: { dark: "#f5c842", light: "#0a0a0f" },
+    }).catch(() => {});
+  }, [mobileUrl]);
 
-/* ── Custom tooltip ── */
-const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number }>; label?: string }) => {
-  if (!active || !payload?.length) return null;
+  const download = async () => {
+    setDownloading(true);
+    try {
+      const token = getToken();
+      const resp = await fetch(`/api/reservations/${res.id}/ticket.pdf`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!resp.ok) { const p = await resp.json().catch(() => ({})); throw new Error(p.message ?? "Failed"); }
+      const blob = await resp.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `ultima-ticket-${res.id}.pdf`;
+      document.body.appendChild(a); a.click(); a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed.");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   return (
-    <div className="gradient-card rounded-xl border border-primary/20 px-4 py-3 text-xs backdrop-blur-md"
-      style={{ boxShadow: "0 8px 30px hsl(var(--primary)/0.15)" }}>
-      <p className="text-muted-foreground uppercase tracking-wider mb-1">{label}</p>
-      <p className="text-primary font-black text-base">{payload[0].value} pts</p>
+    <div className={`gradient-card rounded-xl border transition-colors ${expanded ? "border-primary/40" : "border-border/40 hover:border-primary/20"}`}>
+      {/* Summary row — always visible, click to expand */}
+      <button
+        className="w-full flex items-center gap-3 p-4 text-left"
+        onClick={onToggle}
+      >
+        <div className={`p-2 rounded-xl flex-shrink-0 ${isCoaching ? "bg-violet-500/10" : "bg-primary/10"}`}>
+          {isCoaching ? <GraduationCap size={16} className="text-violet-400" /> : <MapPin size={16} className="text-primary" />}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="font-medium text-sm truncate">{res.court_name ?? "—"}</p>
+            {isCoaching && (
+              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 uppercase tracking-wider">Coach session</span>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground">{res.arena_name}{res.arena_city ? ` · ${res.arena_city}` : ""}</p>
+        </div>
+
+        <div className="text-right flex-shrink-0 hidden sm:block">
+          <p className="text-sm font-medium">{res.reservation_date}</p>
+          <p className="text-xs text-muted-foreground">{String(res.start_time).slice(0,5)} – {String(res.end_time).slice(0,5)}</p>
+        </div>
+
+        <div className="flex flex-col gap-1 items-end flex-shrink-0">
+          <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${
+            isPaid ? "bg-green-500/15 text-green-300" : "bg-amber-500/15 text-amber-300"
+          }`}>{isPaid ? "Paid" : res.payment_status ?? "pending"}</span>
+          {price !== null && (
+            <span className="text-xs font-bold text-primary">
+              {price.toFixed(3)} {res.currency ?? "TND"}
+            </span>
+          )}
+        </div>
+
+        <ChevronDown size={16} className={`text-muted-foreground flex-shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`} />
+      </button>
+
+      {/* Expanded details */}
+      {expanded && (
+        <div className="px-4 pb-5 border-t border-border/40 space-y-4 pt-4">
+          {/* Coaching session banner */}
+          {isCoaching && res.coach_name && (
+            <div className="flex items-center gap-3 rounded-xl border border-violet-500/25 bg-violet-500/8 p-3">
+              <div className="p-1.5 rounded-lg bg-violet-500/15 flex-shrink-0">
+                <GraduationCap size={16} className="text-violet-400" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-violet-300 uppercase tracking-wider">Coaching Session</p>
+                <p className="text-sm font-medium text-foreground">{res.coach_name}</p>
+                {res.coach_specialization && (
+                  <p className="text-xs text-muted-foreground capitalize">{res.coach_specialization}</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Detail grid */}
+          <div className="grid sm:grid-cols-2 gap-3 text-sm">
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Calendar size={13} /> <span>{res.reservation_date}</span>
+              </div>
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Clock size={13} /> <span>{String(res.start_time).slice(0,5)} – {String(res.end_time).slice(0,5)}</span>
+              </div>
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <MapPin size={13} /> <span>{res.arena_name}{res.arena_city ? `, ${res.arena_city}` : ""}</span>
+              </div>
+              {res.num_players && (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Users size={13} /> <span>{res.num_players} player{res.num_players > 1 ? "s" : ""}</span>
+                </div>
+              )}
+            </div>
+            <div className="space-y-2">
+              {res.court_name && (
+                <p className="text-muted-foreground"><span className="text-foreground/70">Court:</span> {res.court_name}</p>
+              )}
+              {res.court_type && (
+                <p className="text-muted-foreground capitalize"><span className="text-foreground/70">Type:</span> {res.court_type.replace("_", " ")}</p>
+              )}
+              {res.surface_type && (
+                <p className="text-muted-foreground capitalize"><span className="text-foreground/70">Surface:</span> {res.surface_type}</p>
+              )}
+              {res.has_lighting && (
+                <p className="text-amber-400 text-xs flex items-center gap-1"><Zap size={11} /> Lit court</p>
+              )}
+              {res.notes && <p className="text-muted-foreground text-xs italic">"{res.notes}"</p>}
+            </div>
+          </div>
+
+          {/* Ticket section */}
+          {isPaid ? (
+            <div className="rounded-xl border border-border/40 bg-background/30 p-4 space-y-3">
+              <p className="text-xs font-semibold text-foreground uppercase tracking-wider">Your Ticket</p>
+              <Button className="glow-yellow gap-2 h-9 text-sm w-full sm:w-auto" onClick={download} disabled={downloading}>
+                {downloading ? <><Loader2 className="animate-spin" size={14} /> Generating…</> : <><Download size={14} /> Download PDF + QR Code</>}
+              </Button>
+              {mobileUrl ? (
+                <div className="flex items-start gap-4 mt-2">
+                  <div className="rounded-xl overflow-hidden border border-primary/30 p-1.5 bg-[#0a0a0f] shrink-0"
+                    style={{ boxShadow: "0 0 16px hsl(var(--primary)/0.15)" }}>
+                    <canvas ref={canvasRef} />
+                  </div>
+                  <div className="flex flex-col gap-1 justify-center">
+                    <span className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+                      <Smartphone size={13} /> Scan to download on phone
+                    </span>
+                    <span className="text-[11px] text-muted-foreground">
+                      Point your camera — PDF downloads directly.
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 size={12} className="animate-spin" /> Loading QR code…
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-300">
+              Payment pending — complete payment to unlock your ticket and QR code.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };
 
+// ── Component ─────────────────────────────────────────────────────────────────
+
 const Performance = () => {
-  const [data, setData] = useState<PerformanceResponse | null>(null);
-  const [matches, setMatches] = useState<PlayerMatch[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState("all");
   const user = getSessionUser();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const routeTab = location.pathname.endsWith("/ai") ? "smartplay" : location.pathname.endsWith("/competitions") ? "competitions" : "reservations";
+  const initialTab = sections.some((s) => s.id === searchParams.get("tab")) ? searchParams.get("tab")! : routeTab;
+  const [tab, setTab] = useState(initialTab);
+  const [reservations, setReservations] = useState<ReservationRecord[]>([]);
+  const [competitions, setCompetitions] = useState<CompetitionRecord[]>([]);
+  const [myClips, setMyClips] = useState<SmartPlayClip[]>([]);
+  const [resLoading, setResLoading] = useState(false);
+  const [compLoading, setCompLoading] = useState(false);
+  const [clipsLoading, setClipsLoading] = useState(false);
+  const [clipVideoUrls, setClipVideoUrls] = useState<Record<number, string>>({});
+  const [expandedResId, setExpandedResId] = useState<number | null>(null);
 
+  // Load section-specific data
   useEffect(() => {
-    const loadPerformance = async () => {
-      if (!user) { setLoading(false); return; }
-      try {
-        const [perf, m] = await Promise.all([
-          api<PerformanceResponse>("/api/performance/me", { authenticated: true }),
-          api<{ matches: PlayerMatch[] }>("/api/player/matches", { authenticated: true }),
-        ]);
-        setData(perf);
-        setMatches(m.matches);
-      } catch {
-        toast.error("Impossible de charger vos statistiques.");
-      } finally {
-        setLoading(false);
-      }
-    };
-    void loadPerformance();
-  }, [user?.id]);
-
-  const statCards = data?.summary
-    ? [
-        {
-          icon: TrendingUp,
-          label: "Points classement",
-          numericValue: data.summary.rankingScore,
-          suffix: "",
-          rawValue: String(data.summary.rankingScore),
-          color: "text-primary",
-          glowColor: "hsl(var(--primary))",
-        },
-        {
-          icon: Target,
-          label: "Taux de victoire",
-          numericValue: parseFloat(data.summary.winRate) || 0,
-          suffix: "%",
-          rawValue: data.summary.winRate,
-          color: "text-blue-400",
-          glowColor: "hsl(210 85% 60%)",
-        },
-        {
-          icon: Flame,
-          label: "Serie en cours",
-          numericValue: null,
-          suffix: "",
-          rawValue: data.summary.streak,
-          color: "text-orange-400",
-          glowColor: "hsl(30 90% 55%)",
-        },
-        {
-          icon: BarChart3,
-          label: "Matchs joues",
-          numericValue: data.summary.wins + data.summary.losses,
-          suffix: "",
-          rawValue: String(data.summary.wins + data.summary.losses),
-          color: "text-green-400",
-          glowColor: "hsl(142 72% 50%)",
-        },
-      ]
-    : [];
-
-  const filteredMatches = useMemo(() => {
-    if (!user) return [];
-    return matches.filter((m) => {
-      const isWinner =
-        (m.winner_team === 1 && (m.team1_player1_id === user.id || m.team1_player2_id === user.id)) ||
-        (m.winner_team === 2 && (m.team2_player1_id === user.id || m.team2_player2_id === user.id));
-      if (filter === "win") return isWinner;
-      if (filter === "loss") return !isWinner;
-      return true;
-    });
-  }, [matches, filter, user?.id]);
+    if (!user) return;
+    if (tab === "reservations" && !reservations.length) {
+      setResLoading(true);
+      api<{ reservations: ReservationRecord[] }>("/api/player/history/reservations", { authenticated: true })
+        .then((r) => setReservations(r.reservations))
+        .catch(() => {
+          api<{ reservations: ReservationRecord[] }>("/api/reservations/my", { authenticated: true })
+            .then((r) => setReservations(r.reservations))
+            .catch(() => {});
+        })
+        .finally(() => setResLoading(false));
+    }
+    if (tab === "competitions" && !competitions.length) {
+      setCompLoading(true);
+      api<{ competitions: CompetitionRecord[] }>("/api/player/history/competitions", { authenticated: true })
+        .then((r) => setCompetitions(r.competitions))
+        .catch(() => {})
+        .finally(() => setCompLoading(false));
+    }
+    if (tab === "smartplay" && !myClips.length) {
+      setClipsLoading(true);
+      api<{ clips: SmartPlayClip[] }>("/api/smartplay/my-clips", { authenticated: true })
+        .then((r) => setMyClips(r.clips))
+        .catch(() => {})
+        .finally(() => setClipsLoading(false));
+    }
+  }, [tab, user?.id]);
 
   if (!user) {
     return (
       <Layout>
         <div className="container py-24 text-center">
-          <h1 className="text-3xl font-display font-bold mb-4">Statistiques indisponibles</h1>
-          <p className="text-muted-foreground mb-8">Connectez-vous pour voir vos statistiques de jeu.</p>
+          <BarChart3 size={48} className="text-muted-foreground mx-auto mb-4" />
+          <h2 className="text-2xl font-display font-bold">Sign in to see your analytics</h2>
         </div>
       </Layout>
     );
@@ -176,250 +301,201 @@ const Performance = () => {
 
   return (
     <Layout>
-      <div className="container py-12">
-        <header className="mb-12">
-          <h1 className="text-4xl md:text-5xl font-display font-bold text-gradient uppercase tracking-tighter mb-4">
-            Performance Player
-          </h1>
-          <p className="text-muted-foreground tracking-widest uppercase text-xs font-bold flex items-center gap-2">
-            <Activity className="text-primary" size={14} /> Statistiques & Historique de Jeu
-          </p>
-        </header>
-
-        {loading ? (
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="gradient-card rounded-2xl border border-border p-6 space-y-4">
-                  <Skeleton className="h-8 w-8 rounded-lg" />
-                  <Skeleton className="h-4 w-24" />
-                  <Skeleton className="h-9 w-20" />
-                </div>
-              ))}
+      <div className="container py-8 lg:py-12 space-y-8">
+        {/* Header */}
+        <div>
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 rounded-xl bg-primary/10">
+              <BarChart3 size={22} className="text-primary" />
             </div>
-            <div className="grid lg:grid-cols-2 gap-6">
-              <div className="gradient-card rounded-2xl border border-border p-8 space-y-4">
-                <Skeleton className="h-8 w-64 rounded-lg" />
-                <Skeleton className="h-[280px] w-full rounded-xl" />
-              </div>
-              <div className="gradient-card rounded-2xl border border-border p-8 space-y-4">
-                <Skeleton className="h-8 w-52 rounded-lg" />
-                <Skeleton className="h-[280px] w-full rounded-xl" />
-              </div>
+            <div>
+              <h1 className="text-3xl md:text-4xl font-display font-bold text-gradient uppercase tracking-tighter">
+                My Analytics
+              </h1>
+              <p className="text-muted-foreground text-sm">{user.firstName} {user.lastName} · Performance Dashboard</p>
             </div>
           </div>
-        ) : (
-          <>
-            {/* ── Stat cards ── */}
-            {!!statCards.length && (
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
-                {statCards.map((stat) => (
-                  <div
-                    key={stat.label}
-                    className="gradient-card rounded-2xl border border-border p-6 shadow-lg hover:border-primary/20 transition-all group"
-                    style={{
-                      boxShadow: `0 0 0 0 ${stat.glowColor}`,
-                      transition: "box-shadow 300ms ease, transform 300ms ease, border-color 300ms ease",
-                    }}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLElement).style.boxShadow = `0 0 30px ${stat.glowColor}28`;
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLElement).style.boxShadow = "0 0 0 0 transparent";
-                    }}
-                  >
-                    <div className="flex items-center gap-3 mb-4">
-                      <div
-                        className="p-2 rounded-lg transition-all group-hover:scale-110"
-                        style={{ background: `${stat.glowColor}18` }}
-                      >
-                        <stat.icon className={stat.color} size={20} />
+        </div>
+
+        {/* Coming Soon Banner */}
+        <div className="gradient-card rounded-2xl border border-primary/20 p-5 flex items-center gap-4">
+          <div className="p-2.5 rounded-xl bg-primary/10 flex-shrink-0">
+            <Zap size={20} className="text-primary" />
+          </div>
+          <div>
+            <p className="text-sm font-bold flex items-center gap-2">
+              VAR Review System
+              <span className="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full bg-primary/15 text-primary border border-primary/20">Coming Soon</span>
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Advanced AI match analytics, ranking scores, and VAR-powered match review will appear here once the system is live.
+            </p>
+          </div>
+        </div>
+
+        {/* Section Tabs */}
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {sections.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => setTab(s.id)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${
+                tab === s.id
+                  ? "bg-primary text-primary-foreground shadow-lg shadow-primary/25"
+                  : "bg-muted text-muted-foreground hover:bg-muted/80"
+              }`}
+            >
+              <s.icon size={14} />
+              {s.label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── Reservations Tab ── */}
+        {tab === "reservations" && (
+          <div className="space-y-4">
+            <h3 className="text-lg font-bold flex items-center gap-2">
+              <Calendar size={18} className="text-primary" /> Reservation History
+            </h3>
+            {resLoading ? (
+              <div className="space-y-3">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-16 rounded-xl" />)}</div>
+            ) : !reservations.length ? (
+              <div className="text-center py-16">
+                <Calendar size={48} className="text-muted-foreground mx-auto mb-4" />
+                <p className="text-muted-foreground">No reservations yet. Book your first court!</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {reservations.map((res) => (
+                  <ReservationCard
+                    key={res.id}
+                    res={res}
+                    expanded={expandedResId === res.id}
+                    onToggle={() => setExpandedResId(expandedResId === res.id ? null : res.id)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── SmartPlay Videos Tab ── */}
+        {tab === "smartplay" && (
+          <div className="space-y-4">
+            <h3 className="text-lg font-bold flex items-center gap-2">
+              <Video size={18} className="text-primary" /> My SmartPlay Videos
+            </h3>
+            <PlayerLiveSessionCard />
+            {clipsLoading ? (
+              <div className="space-y-3">{Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-48 rounded-xl" />)}</div>
+            ) : !myClips.length ? (
+              <div className="text-center py-16">
+                <Video size={48} className="text-muted-foreground mx-auto mb-4" />
+                <p className="text-muted-foreground">No SmartPlay videos shared with you yet.</p>
+                <p className="text-xs text-muted-foreground mt-1">Your coach or admin will share your match analysis videos here.</p>
+              </div>
+            ) : (
+              <div className="space-y-6">
+                {myClips.map((clip) => (
+                  <div key={clip.id} className="gradient-card rounded-2xl border border-border/40 p-5 space-y-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-bold truncate">{clip.originalFilename}</p>
+                        <div className="flex flex-wrap items-center gap-3 mt-1 text-xs text-muted-foreground">
+                          {clip.playedDate && (
+                            <span className="flex items-center gap-1">
+                              <Calendar size={11} />
+                              {new Date(clip.playedDate).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}
+                              {clip.playedTime && ` at ${clip.playedTime}`}
+                            </span>
+                          )}
+                          {clip.courtName && (
+                            <span className="flex items-center gap-1"><MapPin size={11} />{clip.courtName}</span>
+                          )}
+                          {clip.durationSec && (
+                            <span className="flex items-center gap-1"><Clock size={11} />{Math.round(clip.durationSec)}s</span>
+                          )}
+                          <span className="uppercase tracking-widest font-bold text-primary/70">{clip.sportType}</span>
+                        </div>
                       </div>
-                      <span className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">
-                        {stat.label}
+                      <span className="flex-shrink-0 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full bg-green-500/15 text-green-300 border border-green-500/20">
+                        Ready
                       </span>
                     </div>
-                    <div className="text-3xl font-display font-bold">
-                      {stat.numericValue !== null ? (
-                        <CountUp target={stat.numericValue} suffix={stat.suffix} />
-                      ) : (
-                        stat.rawValue
-                      )}
+                    {clipVideoUrls[clip.id] ? (
+                      <video
+                        src={clipVideoUrls[clip.id]}
+                        controls
+                        className="w-full rounded-xl border border-border/50 bg-black aspect-video object-contain"
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const token = getToken();
+                          try {
+                            const resp = await fetch(resolveApiUrl(`/api/smartplay/my-clips/${clip.id}/rendered-video`), {
+                              headers: token ? { Authorization: `Bearer ${token}` } : {},
+                            });
+                            if (!resp.ok) throw new Error("Video not available.");
+                            const url = URL.createObjectURL(await resp.blob());
+                            setClipVideoUrls((prev) => ({ ...prev, [clip.id]: url }));
+                          } catch {
+                            toast.error("Could not load video.");
+                          }
+                        }}
+                        className="flex aspect-video w-full items-center justify-center gap-2 rounded-xl border border-dashed border-border/70 bg-muted/10 text-sm text-muted-foreground hover:bg-muted/20 transition-colors"
+                      >
+                        <Play size={20} /> Watch match analysis
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Competitions Tab ── */}
+        {tab === "competitions" && (
+          <div className="space-y-4">
+            <h3 className="text-lg font-bold flex items-center gap-2">
+              <Trophy size={18} className="text-primary" /> Competition History
+            </h3>
+            {compLoading ? (
+              <div className="space-y-3">{Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-16 rounded-xl" />)}</div>
+            ) : !competitions.length ? (
+              <div className="text-center py-16">
+                <Trophy size={48} className="text-muted-foreground mx-auto mb-4" />
+                <p className="text-muted-foreground">You haven't joined any competitions yet.</p>
+                <Button variant="outline" className="mt-4" onClick={() => window.location.href = "/player/competitions"}>
+                  Browse Competitions
+                </Button>
+              </div>
+            ) : (
+              <div className="grid sm:grid-cols-2 gap-4">
+                {competitions.map((comp) => (
+                  <div key={comp.competition_id} className="gradient-card rounded-xl border border-border/40 p-5 hover:border-primary/30 transition-colors">
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex-1 min-w-0">
+                        <p className="font-bold text-sm truncate">{comp.name}</p>
+                        <p className="text-xs text-muted-foreground">{comp.arena_name}</p>
+                      </div>
+                      <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ml-2 flex-shrink-0 ${
+                        comp.registration_status === "registered"
+                          ? "bg-green-500/15 text-green-300"
+                          : "bg-muted text-muted-foreground"
+                      }`}>{comp.registration_status}</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <span className="flex items-center gap-1"><Trophy size={10} />{comp.sport}</span>
+                      <span className="flex items-center gap-1"><Calendar size={10} />{comp.start_date}</span>
                     </div>
                   </div>
                 ))}
               </div>
             )}
-
-            {/* ── Charts ── */}
-            <div className="grid lg:grid-cols-2 gap-6 mb-12">
-              {/* ELO Area chart with gradient fill */}
-              <div className="gradient-card rounded-2xl border border-border p-8 overflow-hidden">
-                <h3 className="text-lg font-bold font-display uppercase tracking-tighter mb-8 bg-muted/40 p-3 rounded-lg flex items-center gap-2">
-                  <TrendingUp size={16} className="text-primary" /> Progression ELO Score
-                </h3>
-                <div className="h-[300px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={data?.progress} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
-                      <defs>
-                        <linearGradient id="eloGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor={chartPrimary} stopOpacity={0.45} />
-                          <stop offset="95%" stopColor={chartPrimary} stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke={chartGrid} opacity={0.25} vertical={false} />
-                      <XAxis
-                        dataKey="semaine"
-                        stroke="hsl(var(--muted-foreground))"
-                        fontSize={10}
-                        axisLine={false}
-                        tickLine={false}
-                      />
-                      <YAxis
-                        stroke="hsl(var(--muted-foreground))"
-                        fontSize={10}
-                        axisLine={false}
-                        tickLine={false}
-                      />
-                      <Tooltip content={<CustomTooltip />} />
-                      <Area
-                        type="monotone"
-                        dataKey="score"
-                        stroke={chartPrimary}
-                        strokeWidth={2.5}
-                        fill="url(#eloGradient)"
-                        dot={{ fill: chartPrimary, r: 4, strokeWidth: 2, stroke: "hsl(var(--card))" }}
-                        activeDot={{ r: 6, stroke: chartPrimary, strokeWidth: 2, fill: "#fff" }}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              {/* Radar chart */}
-              <div className="gradient-card rounded-2xl border border-border p-8">
-                <h3 className="text-lg font-bold font-display uppercase tracking-tighter mb-8 bg-muted/40 p-3 rounded-lg flex items-center gap-2">
-                  <Target size={16} className="text-blue-400" /> Profil Technique
-                </h3>
-                <div className="h-[300px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <RadarChart data={data?.radar}>
-                      <defs>
-                        <linearGradient id="radarGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor={chartPrimary} stopOpacity={0.5} />
-                          <stop offset="100%" stopColor="hsl(210 85% 60%)" stopOpacity={0.3} />
-                        </linearGradient>
-                      </defs>
-                      <PolarGrid stroke={chartGrid} strokeOpacity={0.4} />
-                      <PolarAngleAxis
-                        dataKey="skill"
-                        tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }}
-                      />
-                      <PolarRadiusAxis tick={false} axisLine={false} />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: chartBg,
-                          border: `1px solid ${chartGrid}`,
-                          borderRadius: "12px",
-                          fontSize: "12px",
-                        }}
-                      />
-                      <Radar
-                        name="Aptitude"
-                        dataKey="value"
-                        stroke={chartPrimary}
-                        strokeWidth={2}
-                        fill="url(#radarGradient)"
-                        fillOpacity={1}
-                      />
-                    </RadarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </div>
-
-            {/* ── Match history ── */}
-            <div className="gradient-card rounded-2xl border border-border p-8 shadow-lg">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-10">
-                <h2 className="text-xl font-bold font-display uppercase tracking-tighter flex items-center gap-3">
-                  <Trophy size={20} className="text-yellow-400" /> Historique des Matchs
-                </h2>
-                <div className="flex gap-2">
-                  {(["all", "win", "loss"] as const).map((f) => (
-                    <Button
-                      key={f}
-                      variant={filter === f ? "default" : "outline"}
-                      size="sm"
-                      className="text-[10px] font-bold tracking-widest uppercase h-8"
-                      onClick={() => setFilter(f)}
-                    >
-                      {f === "all" ? "Tous" : f === "win" ? "Victoires" : "Defaites"}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                {filteredMatches.map((m) => {
-                  const isWinner =
-                    (m.winner_team === 1 && (m.team1_player1_id === user.id || m.team1_player2_id === user.id)) ||
-                    (m.winner_team === 2 && (m.team2_player1_id === user.id || m.team2_player2_id === user.id));
-                  return (
-                    <div
-                      key={m.id}
-                      className="flex flex-col md:flex-row items-center justify-between p-5 rounded-2xl border border-white/5 bg-muted/20 hover:bg-muted/35 hover:border-primary/15 transition-all gap-4 group"
-                    >
-                      <div className="flex items-center gap-5 w-full md:w-auto">
-                        <div
-                          className={`p-3 rounded-full transition-all group-hover:scale-110 ${
-                            isWinner ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
-                          }`}
-                        >
-                          {isWinner ? <CheckCircle2 size={22} /> : <XCircle size={22} />}
-                        </div>
-                        <div>
-                          <div className="text-sm font-bold uppercase tracking-widest flex items-center gap-2">
-                            {isWinner ? "Victoire" : "Defaite"}
-                            <span className="text-xs text-muted-foreground font-normal tracking-normal capitalize">
-                              • {new Date(m.scheduled_at).toLocaleDateString("fr-FR")}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1">
-                            <MapPin size={12} /> {m.arena_name} — {m.court_name}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-4 bg-background/50 px-6 py-3 rounded-xl border border-border group-hover:border-primary/20 transition-all">
-                        <div className="text-2xl font-display font-black tracking-tighter text-gradient">
-                          {m.score1.join(" ")}
-                        </div>
-                        <div className="text-muted-foreground text-xs font-black">VS</div>
-                        <div className="text-2xl font-display font-black tracking-tighter">
-                          {m.score2.join(" ")}
-                        </div>
-                      </div>
-
-                      <div className="w-full md:w-auto flex justify-end">
-                        <Button variant="outline" size="sm" className="text-[10px] font-bold uppercase tracking-widest gap-2 hover:border-primary/40">
-                          Analyses <ArrowRight size={14} />
-                        </Button>
-                      </div>
-                    </div>
-                  );
-                })}
-
-                {filteredMatches.length === 0 && (
-                  <div className="py-20 text-center border-2 border-dashed border-border rounded-3xl">
-                    <Trophy size={32} className="text-muted-foreground/30 mx-auto mb-4" />
-                    <p className="text-muted-foreground uppercase text-xs font-bold tracking-widest">
-                      Aucun match enregistre pour le moment.
-                    </p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </>
+          </div>
         )}
       </div>
     </Layout>

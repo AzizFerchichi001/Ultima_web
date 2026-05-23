@@ -1,140 +1,279 @@
-# ULTIMA Demo Website
+# ULTIMA Web
 
-This project now includes:
-- a Vite + React frontend
-- a demo API in `server/index.mjs`
-- a MySQL-backed runtime data layer for users, courts, reservations, competitions, matches, performance, and logs
+ULTIMA Web is a demo padel arena platform with a React frontend, an Express API, PostgreSQL persistence, live Socket.IO updates, local email testing, and optional SmartPlay AI integration.
 
-## Run locally
+## Tech Stack
 
-Create a `.env` file from `.env.example` and set your MySQL connection values.
+- Frontend: Vite, React, TypeScript, Tailwind CSS, shadcn/Radix UI
+- Backend: Node.js, Express, JWT authentication, Socket.IO
+- Database: PostgreSQL
+- Cache/service layer: Redis is included in Docker and exposed through `REDIS_URL`
+- Email: Nodemailer with Mailpit for local/demo email inboxes
+- Payments: Stripe payment scaffolding for court and coach payments
+- AI: SmartPlay AI endpoints are scaffolded and can connect to an external AI service
 
-If you want to switch quickly between local MySQL and Docker MySQL, use dedicated env files:
+## Main Features
 
-- `.env.localdb` (copy from `.env.localdb.example`) for local MySQL, usually `MYSQL_PORT=3306`
-- `.env.dockerdb` (copy from `.env.dockerdb.example`) for Docker MySQL exposed on host, usually `MYSQL_PORT=3308`
+- Player, coach, and admin authentication
+- Email verification and forgot-password flows
+- Multi-arena court browsing and reservations
+- Competition listing and registration
+- Coach profiles, coaching requests, and coach/player relationships
+- Live match scoring through Socket.IO
+- Admin dashboards for users, courts, reservations, logs, stats, scoring, billing, and platform status
+- Reservation ticket/QR verification support
+- SmartPlay AI analysis queue endpoints
 
-In one terminal:
+## Project Structure
+
+```text
+Ultima_web/
+  src/                      React frontend
+  server/                   Express API and database adapters
+  database/                 PostgreSQL schema/seed files and legacy migration files
+  scripts/                  Utility and migration scripts
+  docker-compose.yml        Full demo stack: web, API, PostgreSQL, Redis, Mailpit
+  docker-compose.postgres.yml
+                            PostgreSQL-only helper stack
+```
+
+## Requirements
+
+- Node.js 22 or newer recommended
+- npm
+- Docker Desktop, if you want the recommended full local stack
+- PostgreSQL, only if running the database without Docker
+
+## Environment
+
+Create a `.env` file from `.env.example`.
+
+Important variables:
+
+```env
+DB_CLIENT=postgres
+PG_HOST=127.0.0.1
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=
+PG_DATABASE=ultima_web
+JWT_SECRET=change-me
+PORT=3001
+PUBLIC_WEB_BASE_URL=http://localhost:5173
+REDIS_URL=redis://127.0.0.1:6379
+SMARTPLAY_AI_URL=
+```
+
+`DB_CLIENT=postgres` is the current default runtime path. The repository still contains older MySQL migration/adapter files from the migration history, but the README and Docker demo stack are PostgreSQL-based.
+
+## Run With Docker
+
+The easiest way to run the full demo is:
+
+```bash
+docker compose up -d --build
+```
+
+Services:
+
+- Web app: `http://localhost:5173`
+- API: `http://localhost:3001`
+- API health: `http://localhost:3001/api/health`
+- PostgreSQL: host port `5433`, container port `5432`
+- Redis: `localhost:6379`
+- Mailpit inbox: `http://localhost:8025`
+- Mailpit SMTP: `localhost:1025`
+
+The main Docker stack initializes PostgreSQL with:
+
+- `database/postgres_init.sql`
+- `database/smartplay_upgrade.sql`
+
+Stop the stack:
+
+```bash
+docker compose down
+```
+
+Remove persisted demo database/cache volumes:
+
+```bash
+docker compose down -v
+```
+
+## Run Locally Without Docker
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Create and seed a PostgreSQL database. The default database name is `ultima_web`:
+
+```bash
+createdb -U postgres ultima_web
+psql -U postgres -d ultima_web -f database/postgres_init.sql
+psql -U postgres -d ultima_web -f database/smartplay_upgrade.sql
+```
+
+Start the API:
 
 ```bash
 npm run server
 ```
 
-In a second terminal:
+Start the frontend in a second terminal:
 
 ```bash
 npm run dev
 ```
 
-The Vite dev server proxies `/api` requests to `http://localhost:3001`.
+The Vite dev server proxies `/api`, `/public`, and `/socket.io` requests to `http://localhost:3001`.
 
-## Email flows (forgot password + verification)
+## Local PostgreSQL Helper
 
-The project now supports real email-link flows:
+To start only PostgreSQL with Docker:
 
-- `POST /api/auth/forgot-password` sends a reset link
-- `GET /api/auth/verify-email?token=...` verifies a signup email link
-- `POST /api/auth/resend-verification` resends verification email
+```bash
+docker compose -f docker-compose.postgres.yml up -d
+```
 
-### Docker (recommended for demo)
+Then point your env file at:
 
-`docker-compose.yml` includes a local SMTP catcher (`mailpit`):
+```env
+PG_HOST=127.0.0.1
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=admin
+PG_DATABASE=ultima_demo
+```
 
-- SMTP server: `localhost:1025`
+Seed that helper database after the container is ready:
+
+```bash
+psql -h 127.0.0.1 -U postgres -d ultima_demo -f database/postgres_init.sql
+psql -h 127.0.0.1 -U postgres -d ultima_demo -f database/smartplay_upgrade.sql
+```
+
+## Redis
+
+Redis is included in the full Docker stack as `ultima-redis` and is available at:
+
+```env
+REDIS_URL=redis://127.0.0.1:6379
+```
+
+In this project Redis is an optional supporting service. Core API/database flows do not require Redis, but the Docker stack starts it so cache/queue-style features can be enabled consistently through `REDIS_URL` as the backend grows.
+
+The Redis container uses:
+
+- image: `redis:7-alpine`
+- append-only persistence
+- `128mb` memory limit
+- `allkeys-lru` eviction policy
+- persisted volume: `redis_data`
+
+## Email Flows
+
+The project supports real email-link/code flows:
+
+- `POST /api/auth/forgot-password`
+- `GET /api/auth/verify-email?token=...`
+- `POST /api/auth/resend-verification`
+
+For Docker demos, Mailpit is already included:
+
+- SMTP host inside Docker: `mailpit`
+- SMTP host from your machine: `127.0.0.1`
+- SMTP port: `1025`
 - Inbox UI: `http://localhost:8025`
 
-Start stack:
+To send real emails, configure:
 
-```bash
-docker compose up -d --build
+```env
+SMTP_HOST=smtp.your-provider.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=your_account@example.com
+SMTP_PASS=your_app_password
+SMTP_FROM=your_account@example.com
 ```
 
-Then:
+When running through Docker, `docker-compose.yml` also supports `SMTP_HOST_DOCKER`.
 
-1. Sign up a new player/coach account.
-2. Open `http://localhost:8025`.
-3. Click the verification link in the received email.
-4. Use forgot-password and open the reset link from the same inbox.
-
-To send to real email inboxes from Docker, set these env vars in `.env` and restart:
-
-- `SMTP_HOST_DOCKER=smtp.gmail.com` (or your provider)
-- `SMTP_PORT=587`
-- `SMTP_SECURE=false`
-- `SMTP_USER=your_account@provider.com`
-- `SMTP_PASS=your_app_password_or_smtp_password`
-- `SMTP_FROM=your_account@provider.com`
-
-Then:
-
-```bash
-docker compose down
-docker compose up -d --build
-```
-
-### Local (without Docker)
-
-If you run API directly (`npm run server`), use SMTP env values in `.env`:
-
-- `SMTP_HOST=127.0.0.1`
-- `SMTP_PORT=1025`
-- `SMTP_SECURE=false`
-- `SMTP_FROM=noreply@ultima.local`
-
-Make sure Mailpit is running (Docker service `mailpit`) or point SMTP to any provider.
-
-### Quick mode switch
-
-Run backend against local MySQL:
-
-```bash
-npm run server:localdb
-```
-
-Run backend against Docker MySQL:
-
-```bash
-npm run server:dockerdb
-```
-
-Watch mode variants:
-
-```bash
-npm run server:localdb:dev
-npm run server:dockerdb:dev
-```
-
-## Demo accounts
+## Demo Accounts
 
 - Admin: `aziz@email.com` / `demo12345`
 - Player: `ahmed@email.com` / `demo12345`
 - Coach: `sami@email.com` / `demo12345`
 
-## Demo backend features
+Some test seed scripts may also create arena test accounts when `ENABLE_TEST_SEED=1`.
 
-- signup and login with JWT auth
-- court listing and reservation creation
-- competition listing and registration
-- live score feed with simulated updates
-- admin overview for users, courts, logs, and stats
-- performance endpoint for the signed-in user
-- SmartPlay AI analysis queue endpoint scaffold
-
-## Notes
-
-- The runtime backend now expects a MySQL database named by `MYSQL_DATABASE`.
-- Import `database/mysql_demo_dump.sql` into MySQL before starting the backend.
-- New signups are inserted directly into MySQL.
-- `active/inactive` is now a real behavior: inactive users are blocked from logging in.
-- The provided PDF could not be parsed directly in this environment because PDF extraction libraries were unavailable, so implementation was aligned to the current frontend and the visible requirements already present in the app.
-
-## MySQL Workbench import
-
-- MySQL dump: `database/mysql_demo_dump.sql`
-- Regenerate it from the current demo JSON with:
+## Useful Scripts
 
 ```bash
-node scripts/export-mysql-demo.mjs
+npm run dev                  # Start Vite frontend
+npm run server               # Start Express API with .env
+npm run server:dev           # Start API in watch mode with .env
+npm run server:localdb       # Start API with .env.localdb
+npm run server:localdb:dev   # Watch mode with .env.localdb
+npm run server:dockerdb      # Start API with .env.dockerdb
+npm run server:dockerdb:dev  # Watch mode with .env.dockerdb
+npm run build                # Production frontend build
+npm run preview              # Preview built frontend
+npm run lint                 # Run ESLint
+npm run test                 # Run Vitest
 ```
 
-- The dump creates a database named `ultima_demo` and fills it with users, terrains, reservations, competitions, match data, performance data, AI analyses, and activity logs.
+## Database Notes
+
+- The runtime backend expects PostgreSQL when `DB_CLIENT=postgres`.
+- Main schema/seed file: `database/postgres_init.sql`
+- SmartPlay schema upgrade: `database/smartplay_upgrade.sql`
+- The old MySQL dump files are kept for migration/reference history only.
+- New signups, reservations, competitions, performance data, logs, coaching data, and billing records are stored in PostgreSQL in the current demo stack.
+- Inactive users are blocked from logging in.
+
+## SmartPlay AI
+
+SmartPlay AI endpoints are available in the API, but the AI microservice is optional.
+
+Set this when the AI backend is deployed:
+
+```env
+SMARTPLAY_AI_URL=http://your-ai-service
+```
+
+Without `SMARTPLAY_AI_URL`, the platform continues to run normally and reports the AI service as not connected.
+
+## Stripe
+
+Stripe variables are optional for local demo work unless you are testing payment flows:
+
+```env
+STRIPE_SECRET_KEY=sk_test_
+STRIPE_WEBHOOK_SECRET=whsec_
+```
+
+The current payment code converts TND display amounts to EUR because TND is not a native Stripe currency.
+
+## API Health Check
+
+Check API and selected database adapter:
+
+```bash
+curl http://localhost:3001/api/health
+```
+
+Expected shape:
+
+```json
+{
+  "status": "ok",
+  "db": {
+    "requested": "postgres",
+    "selected": "postgres"
+  }
+}
+```
